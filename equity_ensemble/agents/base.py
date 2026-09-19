@@ -9,11 +9,12 @@ instead of three copies.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Generic, TypeVar
 
 from pydantic import BaseModel
 
-from equity_ensemble.llm.client import LLMClient
+from equity_ensemble.llm.client import LLMClient, LLMError
 
 ClaimT = TypeVar("ClaimT", bound=BaseModel)
 
@@ -42,7 +43,7 @@ async def run_with_validation_retry(
     *,
     llm: LLMClient,
     system_prompt: str,
-    build_user_prompt: callable,
+    build_user_prompt: Callable[[str | None], str],
     response_model: type[ClaimT],
 ) -> ClaimT:
     """PRD §8.1 retry policy: one retry with the validation error appended
@@ -51,4 +52,20 @@ async def run_with_validation_retry(
     `build_user_prompt` is `(previous_error: str | None) -> str` so the
     retry attempt can include what went wrong the first time.
     """
-    raise NotImplementedError("Track C: implement the shared retry-on-validation-failure loop")
+    try:
+        return await llm.complete_structured(
+            system_prompt=system_prompt,
+            user_prompt=build_user_prompt(None),
+            response_model=response_model,
+        )
+    except LLMError as first_error:
+        try:
+            return await llm.complete_structured(
+                system_prompt=system_prompt,
+                user_prompt=build_user_prompt(str(first_error)),
+                response_model=response_model,
+            )
+        except LLMError as second_error:
+            raise AgentUnavailable(
+                f"{response_model.__name__} failed schema validation twice"
+            ) from second_error
