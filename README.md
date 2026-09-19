@@ -369,21 +369,44 @@ cp .env.example .env
 `.env.example` documents every variable — see
 [Configuration reference](#configuration-reference) below.
 
-### Start Postgres and apply migrations
+> **Note**: nothing in the app auto-loads `.env` — pass `--env-file .env`
+> to every `uv run` invocation below, otherwise the process reads empty env
+> vars and fails with a `KeyError` on first use. `make up`/`make down`
+> (below) handle this for you.
+
+### Quickest path: `make up` / `make down`
+
+```bash
+make up      # starts Postgres+pgvector, applies migrations, starts the API
+make status  # check what's running
+make logs    # tail the API log
+make down    # stops the API and the containers
+```
+
+`make up` creates `.env` from `.env.example` if it doesn't exist yet, waits
+for Postgres to be healthy, runs migrations, and starts the FastAPI app in
+the background (PID tracked in `.run/api.pid`, logs in `.run/api.log`). Both
+targets are idempotent — safe to re-run `make up` if the API is already
+running, and `make down` if nothing is.
+
+```bash
+curl -X POST http://127.0.0.1:8000/forecast \
+  -H 'content-type: application/json' \
+  -d '{"ticker": "AAPL", "horizon_days": 21}'
+```
+
+### Manual steps (equivalent to `make up`, one at a time)
 
 ```bash
 docker compose up -d
 uv run --env-file .env python -m equity_ensemble.persistence.migrate
+uv run --env-file .env uvicorn equity_ensemble.api.main:app --reload
 ```
 
 This starts Postgres+pgvector on `localhost:5433` (chosen to avoid
 colliding with a default local Postgres on 5432 — see `docker-compose.yml`
-and `.env.example`).
-
-> **Note**: nothing in the app auto-loads `.env` — pass `--env-file .env`
-> to every `uv run` invocation below (or `export $(cat .env | xargs)`
-> first), otherwise the process reads empty env vars and fails with a
-> `KeyError` on first use.
+and `.env.example`). `--reload` is useful for active development but isn't
+used by `make up`, since its PID tracking assumes a single stable process.
 
 ### Run the CLI
 
@@ -392,19 +415,9 @@ uv run --env-file .env python -m equity_ensemble.cli.main run AAPL --horizon 21
 ```
 
 Writes `forecast_AAPL_<run_id>.md` and `.json` to the current directory and
-prints the report to stdout.
-
-### Run the API
-
-```bash
-uv run --env-file .env uvicorn equity_ensemble.api.main:app --reload
-```
-
-```bash
-curl -X POST http://127.0.0.1:8000/forecast \
-  -H 'content-type: application/json' \
-  -d '{"ticker": "AAPL", "horizon_days": 21}'
-```
+prints the report to stdout. (The CLI isn't started by `make up` — it's a
+one-shot command, not a long-running service — but needs the same
+`docker compose up -d` + migration step first.)
 
 Interactive docs are served at `http://127.0.0.1:8000/docs`.
 
@@ -454,6 +467,7 @@ tests/
   integration/                  # fixture/fake-backed and real-Postgres tests
   fixtures/                     # recorded FMP responses, sample filing text
 docker-compose.yml              # local Postgres+pgvector for dev
+Makefile                         # make up / make down / make logs / make status
 ```
 
 ## Configuration reference

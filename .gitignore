@@ -34,3 +34,6 @@ htmlcov/
 # Generated forecast output (CLI writes these to the cwd)
 forecast_*.md
 forecast_*.json
+
+# make up/down runtime state (pid file, API log)
+.run/
