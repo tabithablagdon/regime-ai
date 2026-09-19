@@ -121,6 +121,41 @@ async def test_unknown_ticker_returns_404_from_api(monkeypatch):
     assert response.status_code == 404
 
 
+async def test_engine_failure_returns_503_not_a_raw_500(monkeypatch):
+    """When the reasoning pipeline itself fails (e.g. the LLM call isn't
+    hooked up to a real key), the API must return a clean, distinguishable
+    503 rather than leaking a stack trace as a generic 500."""
+    from equity_ensemble.api.main import ENGINE_UNAVAILABLE_DETAIL
+    from equity_ensemble.llm.client import LLMError
+
+    async def technicals(ticker, horizon_days):
+        return _canned_report().agent_claims[0]
+
+    async def fundamentals(ticker, horizon_days):
+        return _canned_report().agent_claims[0]
+
+    async def meta(ticker, horizon_days, technicals_claim, fundamentals_claim):
+        raise LLMError("simulated: OPENROUTER_API_KEY is not a real key")
+
+    graph = build_graph(
+        technicals_agent=technicals, fundamentals_agent=fundamentals, meta_agent=meta
+    )
+    fmp = RecordedFMPClient(FIXTURES_DIR / "fmp")
+
+    async def fake_get_profile(ticker):
+        return {"symbol": ticker}
+
+    monkeypatch.setattr(fmp, "get_profile", fake_get_profile)
+
+    app = create_app(graph=graph, fmp=fmp)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/forecast", json={"ticker": "AAPL"})
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == ENGINE_UNAVAILABLE_DETAIL
+
+
 async def test_unknown_ticker_exits_nonzero_from_cli(tmp_path, monkeypatch):
     from equity_ensemble.data.fmp_client import TickerNotFoundError
 

@@ -16,6 +16,7 @@ lifespan hook.
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -25,6 +26,10 @@ from pydantic import BaseModel
 from equity_ensemble.data.fmp_client import FMPClient, TickerNotFoundError
 from equity_ensemble.graph.build_graph import run_forecast
 from equity_ensemble.render.markdown_report import render_markdown
+
+logger = logging.getLogger(__name__)
+
+ENGINE_UNAVAILABLE_DETAIL = "The analysis engine is not available right now."
 
 
 class ForecastRequest(BaseModel):
@@ -42,10 +47,28 @@ def _register_routes(app: FastAPI) -> None:
             raise HTTPException(
                 status_code=404, detail=f"unknown or unsupported ticker: {ticker}"
             ) from exc
+        except Exception:
+            # A genuinely unknown ticker is TickerNotFoundError (above, 404).
+            # Anything else here — FMP key not configured, FMP unreachable —
+            # means the engine can't even validate the ticker, same class of
+            # problem as the pipeline failure below.
+            logger.exception("ticker validation failed for ticker=%s", ticker)
+            raise HTTPException(status_code=503, detail=ENGINE_UNAVAILABLE_DETAIL) from None
 
-        report = await run_forecast(
-            app.state.graph, ticker=ticker, horizon_days=request.horizon_days
-        )
+        try:
+            report = await run_forecast(
+                app.state.graph, ticker=ticker, horizon_days=request.horizon_days
+            )
+        except Exception:
+            # Any failure inside the agent/graph pipeline — an LLM call that
+            # isn't hooked up to a real key, both specialists unavailable,
+            # a vendor outage — is the same problem from the caller's point
+            # of view: the reasoning engine didn't produce a report. Log the
+            # real cause server-side but never leak a stack trace to the
+            # client.
+            logger.exception("forecast pipeline failed for ticker=%s", ticker)
+            raise HTTPException(status_code=503, detail=ENGINE_UNAVAILABLE_DETAIL) from None
+
         return {**report.model_dump(mode="json"), "report_markdown": render_markdown(report)}
 
 
