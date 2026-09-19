@@ -373,17 +373,22 @@ cp .env.example .env
 
 ```bash
 docker compose up -d
-uv run python -m equity_ensemble.persistence.migrate
+uv run --env-file .env python -m equity_ensemble.persistence.migrate
 ```
 
 This starts Postgres+pgvector on `localhost:5433` (chosen to avoid
 colliding with a default local Postgres on 5432 — see `docker-compose.yml`
 and `.env.example`).
 
+> **Note**: nothing in the app auto-loads `.env` — pass `--env-file .env`
+> to every `uv run` invocation below (or `export $(cat .env | xargs)`
+> first), otherwise the process reads empty env vars and fails with a
+> `KeyError` on first use.
+
 ### Run the CLI
 
 ```bash
-uv run python -m equity_ensemble.cli.main run AAPL --horizon 21
+uv run --env-file .env python -m equity_ensemble.cli.main run AAPL --horizon 21
 ```
 
 Writes `forecast_AAPL_<run_id>.md` and `.json` to the current directory and
@@ -392,7 +397,7 @@ prints the report to stdout.
 ### Run the API
 
 ```bash
-uv run uvicorn equity_ensemble.api.main:app --reload
+uv run --env-file .env uvicorn equity_ensemble.api.main:app --reload
 ```
 
 ```bash
