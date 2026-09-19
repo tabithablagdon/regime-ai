@@ -4,6 +4,7 @@ synthesize node receives whatever the fan-out produced."""
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from uuid import uuid4
 
@@ -88,6 +89,70 @@ async def test_one_agent_unavailable_degrades_to_none_not_a_crash():
     assert isinstance(report, ForecastReport)
     assert seen["technicals"] is None
     assert seen["fundamentals"].agent == "fundamentals_sentiment"
+
+
+async def test_vendor_failure_degrades_to_single_agent_mode(caplog):
+    """A rate limit or outage inside one specialist must cost only that
+    specialist's claim, not the whole run (PRD §11 graceful degradation)."""
+    seen: dict[str, object] = {}
+
+    async def technicals(ticker, horizon_days):
+        return _claim("technicals")
+
+    async def fundamentals(ticker, horizon_days):
+        raise RuntimeError("voyage rate limit: 3 RPM / 10K TPM")
+
+    async def meta(ticker, horizon_days, technicals_claim, fundamentals_claim):
+        seen["technicals"] = technicals_claim
+        seen["fundamentals"] = fundamentals_claim
+        return _report()
+
+    graph = build_graph(
+        technicals_agent=technicals, fundamentals_agent=fundamentals, meta_agent=meta
+    )
+    caplog.set_level(logging.INFO)
+    report = await run_forecast(graph, ticker="AAPL", horizon_days=21)
+
+    assert isinstance(report, ForecastReport)
+    assert seen["fundamentals"] is None
+    assert seen["technicals"].agent == "technicals"
+    assert "fundamentals_sentiment unavailable ticker=AAPL" in caplog.text
+    assert "reason=RuntimeError" in caplog.text
+    # The real cause is still recorded server-side, not swallowed.
+    assert "voyage rate limit" in caplog.text
+
+
+class _FakeCompiledGraph:
+    """Stands in for a compiled LangGraph graph — just records what `config`
+    it was invoked with, so config-forwarding can be tested without
+    exercising real LangGraph callback machinery."""
+
+    def __init__(self, report: ForecastReport) -> None:
+        self._report = report
+        self.received_config: object = "not called"
+
+    async def ainvoke(self, state, config=None):
+        self.received_config = config
+        return {"report": self._report}
+
+
+async def test_run_forecast_forwards_config_to_ainvoke():
+    """config={"callbacks": [tracer]} (api/main.py's LangSmith wiring) must
+    actually reach the graph invocation, not be silently dropped."""
+    fake_graph = _FakeCompiledGraph(_report())
+    sentinel_config = {"callbacks": ["sentinel-tracer"]}
+
+    await run_forecast(fake_graph, ticker="AAPL", horizon_days=21, config=sentinel_config)
+
+    assert fake_graph.received_config is sentinel_config
+
+
+async def test_run_forecast_defaults_config_to_none():
+    fake_graph = _FakeCompiledGraph(_report())
+
+    await run_forecast(fake_graph, ticker="AAPL", horizon_days=21)
+
+    assert fake_graph.received_config is None
 
 
 async def test_both_agents_unavailable_propagates_meta_agents_error():

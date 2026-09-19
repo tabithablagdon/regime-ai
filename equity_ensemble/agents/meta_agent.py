@@ -109,6 +109,30 @@ def _critique_prompt(*, own: AgentClaim, other: AgentClaim) -> str:
     )
 
 
+def _preserve_identity_and_regime(revised: AgentClaim, original: AgentClaim) -> AgentClaim:
+    """The critique round may revise direction, magnitude, and confidence
+    (PRD §8.3). It may not reassign which agent is speaking, or restate the
+    regime: that is classified in code by the Technicals agent (PRD §6.1),
+    and a claim coming back through the LLM is exactly where a fabricated
+    label would slip in. Enforced here rather than requested in the prompt,
+    matching how `TechnicalsAgent.run` pins the same fields.
+
+    Without this the revised claims came back with invented labels (observed
+    live: `breakdown` for Technicals, whose classifier had said
+    `Mean-Reverting`, and `bull_market` for Fundamentals/Sentiment, which has
+    no regime of its own), and that label reached the rationale prompt and
+    then the user-facing thesis.
+    """
+    return revised.model_copy(
+        update={
+            "agent": original.agent,
+            "ticker": original.ticker,
+            "regime_label": original.regime_label,
+            "regime_changed": original.regime_changed,
+        }
+    )
+
+
 async def run_critique_round(
     llm: LLMClient, technicals: AgentClaim, fundamentals: AgentClaim
 ) -> tuple[AgentClaim, AgentClaim, list[str]]:
@@ -116,15 +140,21 @@ async def run_critique_round(
     evidence, reconsiders confidence/magnitude. Nothing is overwritten —
     caller keeps the pre-critique originals for the dissent log; this
     returns the revised claims plus a human-readable log of what changed."""
-    revised_technicals = await llm.complete_structured(
-        system_prompt=CRITIQUE_SYSTEM_PROMPT,
-        user_prompt=_critique_prompt(own=technicals, other=fundamentals),
-        response_model=AgentClaim,
+    revised_technicals = _preserve_identity_and_regime(
+        await llm.complete_structured(
+            system_prompt=CRITIQUE_SYSTEM_PROMPT,
+            user_prompt=_critique_prompt(own=technicals, other=fundamentals),
+            response_model=AgentClaim,
+        ),
+        technicals,
     )
-    revised_fundamentals = await llm.complete_structured(
-        system_prompt=CRITIQUE_SYSTEM_PROMPT,
-        user_prompt=_critique_prompt(own=fundamentals, other=technicals),
-        response_model=AgentClaim,
+    revised_fundamentals = _preserve_identity_and_regime(
+        await llm.complete_structured(
+            system_prompt=CRITIQUE_SYSTEM_PROMPT,
+            user_prompt=_critique_prompt(own=fundamentals, other=technicals),
+            response_model=AgentClaim,
+        ),
+        fundamentals,
     )
 
     critique_log = [

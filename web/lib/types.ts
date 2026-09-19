@@ -52,6 +52,9 @@ export interface ForecastReport {
   critique_log: string[];
   citations: Evidence[];
   report_markdown: string;
+  /** LangSmith trace URL for this run's graph execution, when the backend
+   * has LANGSMITH_API_KEY configured — null otherwise. */
+  trace_url: string | null;
 }
 
 /** Shape returned by our own /api/forecast route on any non-200 response. */

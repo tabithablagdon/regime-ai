@@ -10,6 +10,7 @@ from equity_ensemble.agents.meta_agent import (
     check_conflict,
     fit_distribution,
     resolve_weights,
+    run_critique_round,
 )
 from equity_ensemble.llm.client import FakeLLMClient
 
@@ -89,6 +90,95 @@ class TestFitDistribution:
     def test_requires_at_least_one_claim(self):
         with pytest.raises(ValueError):
             fit_distribution(None, None, resolve_weights(None))
+
+
+class TestCritiqueRoundGuardrails:
+    """The regime is classified in code (PRD §6.1). A claim making a round
+    trip through the LLM is where a fabricated label slips in, so the
+    critique round has to pin the fields it is not allowed to revise."""
+
+    async def test_llm_cannot_invent_a_regime_label_for_technicals(
+        self, technicals_claim_factory, fundamentals_claim_factory
+    ):
+        t = technicals_claim_factory(
+            direction="bullish", confidence=0.8, regime_label="Mean-Reverting"
+        )
+        f = fundamentals_claim_factory(direction="bearish", confidence=0.8)
+        # What was actually observed live: the model returns a label the
+        # deterministic classifier never produces.
+        hallucinated = technicals_claim_factory(
+            direction="bearish", confidence=0.55, regime_label="breakdown", regime_changed=True
+        )
+        llm = FakeLLMClient(responses=[hallucinated, fundamentals_claim_factory()])
+
+        revised_t, _, _ = await run_critique_round(llm, t, f)
+
+        assert revised_t.regime_label == "Mean-Reverting"
+        assert revised_t.regime_changed is False
+
+    async def test_fundamentals_keeps_no_regime_of_its_own(
+        self, technicals_claim_factory, fundamentals_claim_factory
+    ):
+        t = technicals_claim_factory(direction="bullish", confidence=0.8)
+        f = fundamentals_claim_factory(direction="bearish", confidence=0.8)
+        assert f.regime_label is None
+        hallucinated = fundamentals_claim_factory(regime_label="bull_market")
+        llm = FakeLLMClient(responses=[technicals_claim_factory(), hallucinated])
+
+        _, revised_f, _ = await run_critique_round(llm, t, f)
+
+        assert revised_f.regime_label is None
+
+    async def test_agent_and_ticker_cannot_drift(
+        self, technicals_claim_factory, fundamentals_claim_factory
+    ):
+        t = technicals_claim_factory(direction="bullish", confidence=0.8)
+        f = fundamentals_claim_factory(direction="bearish", confidence=0.8)
+        impostor = technicals_claim_factory(agent="fundamentals_sentiment", ticker="MSFT")
+        llm = FakeLLMClient(responses=[impostor, fundamentals_claim_factory()])
+
+        revised_t, _, _ = await run_critique_round(llm, t, f)
+
+        assert revised_t.agent == "technicals"
+        assert revised_t.ticker == "AAPL"
+
+    async def test_revisable_fields_still_come_from_the_critique(
+        self, technicals_claim_factory, fundamentals_claim_factory
+    ):
+        t = technicals_claim_factory(direction="bullish", magnitude_bps=250, confidence=0.8)
+        f = fundamentals_claim_factory(direction="bearish", confidence=0.8)
+        revised = technicals_claim_factory(
+            direction="neutral", magnitude_bps=90, confidence=0.45
+        )
+        llm = FakeLLMClient(responses=[revised, fundamentals_claim_factory()])
+
+        revised_t, _, _ = await run_critique_round(llm, t, f)
+
+        assert revised_t.direction == "neutral"
+        assert revised_t.magnitude_bps == 90
+        assert revised_t.confidence == 0.45
+
+    async def test_hallucinated_regime_never_reaches_the_rationale_prompt(
+        self, technicals_claim_factory, fundamentals_claim_factory
+    ):
+        t = technicals_claim_factory(
+            direction="bullish", confidence=0.9, regime_label="Mean-Reverting"
+        )
+        f = fundamentals_claim_factory(direction="bearish", confidence=0.9)
+        llm = FakeLLMClient(
+            responses=[
+                technicals_claim_factory(direction="bearish", regime_label="breakdown"),
+                fundamentals_claim_factory(direction="bullish", regime_label="bull_market"),
+                _ThesisResponse(thesis="Unresolved disagreement."),
+            ]
+        )
+
+        await MetaAgent(llm).run("AAPL", 21, t, f)
+
+        rationale_prompt = llm.calls[-1][1]
+        assert "breakdown" not in rationale_prompt
+        assert "bull_market" not in rationale_prompt
+        assert "regime=Mean-Reverting" in rationale_prompt
 
 
 class TestMetaAgentRun:

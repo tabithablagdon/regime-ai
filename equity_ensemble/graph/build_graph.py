@@ -14,13 +14,14 @@ that into separate graph nodes would just relocate the same logic without
 changing behavior, so `synthesize` calls it as one node rather than as
 several conditionally-wired ones.
 
-If a specialist raises `AgentUnavailable` (PRD §8.1, two failed validation
-retries), its node stores `None` rather than crashing the run — `synthesize`
-already handles a `None` claim as single-agent mode. If *both* specialists
-are unavailable, `MetaAgent.run` raises `ValueError` and that propagates out
-of the compiled graph; the API/CLI layer is responsible for turning that
-into a 5xx / error message, since the PRD only specifies graceful
-degradation for a single failed agent.
+If a specialist fails, its node stores `None` rather than crashing the run —
+`synthesize` already handles a `None` claim as single-agent mode. That covers
+both failure classes PRD §8.1 and §11 call out: `AgentUnavailable` (two
+failed schema-validation retries) and a vendor failure such as a rate limit
+or an outage. If *both* specialists are unavailable, `MetaAgent.run` raises
+`ValueError` and that propagates out of the compiled graph; the API/CLI layer
+is responsible for turning that into a 5xx / error message, since the PRD
+only specifies graceful degradation for a single failed agent.
 """
 
 from __future__ import annotations
@@ -77,34 +78,44 @@ def build_graph(
     bound agent methods (e.g. `TechnicalsAgent(...).run`) as the callables —
     each just needs to match the Protocol signatures above."""
 
-    async def technicals_node(state: GraphState) -> dict:
+    async def run_specialist(
+        agent: SpecialistCallable, name: str, state: GraphState
+    ) -> AgentClaim | None:
+        """Returns `None` instead of raising, so one failed specialist costs
+        its own claim and not the whole run. `AgentUnavailable` is the
+        schema-retry path (PRD §8.1); any other exception is a vendor or
+        upstream failure, which PRD §11 also requires degrading to
+        single-agent mode rather than failing the request. The Meta-Agent
+        turns a `None` claim into an escalated single-agent report, so the
+        cause is stated in the report instead of being silently dropped.
+        """
         try:
-            claim = await technicals_agent(state.ticker, state.horizon_days)
+            return await agent(state.ticker, state.horizon_days)
         except AgentUnavailable:
-            log_event(
-                logger,
-                "technicals",
-                "unavailable",
-                ticker=state.ticker,
-                horizon_days=state.horizon_days,
-                run_id=state.run_id,
-            )
-            claim = None
+            reason = "failed schema validation twice"
+        except Exception as exc:
+            # Full traceback server-side; the audit line keeps just the type
+            # so it stays one readable line.
+            logger.exception("%s agent failed for ticker=%s", name, state.ticker)
+            reason = type(exc).__name__
+
+        log_event(
+            logger,
+            name,
+            "unavailable",
+            ticker=state.ticker,
+            horizon_days=state.horizon_days,
+            run_id=state.run_id,
+            reason=reason,
+        )
+        return None
+
+    async def technicals_node(state: GraphState) -> dict:
+        claim = await run_specialist(technicals_agent, "technicals", state)
         return {"technicals_claim": claim}
 
     async def fundamentals_node(state: GraphState) -> dict:
-        try:
-            claim = await fundamentals_agent(state.ticker, state.horizon_days)
-        except AgentUnavailable:
-            log_event(
-                logger,
-                "fundamentals_sentiment",
-                "unavailable",
-                ticker=state.ticker,
-                horizon_days=state.horizon_days,
-                run_id=state.run_id,
-            )
-            claim = None
+        claim = await run_specialist(fundamentals_agent, "fundamentals_sentiment", state)
         return {"fundamentals_claim": claim}
 
     async def synthesize_node(state: GraphState) -> dict:
@@ -128,11 +139,18 @@ def build_graph(
 
 
 async def run_forecast(
-    compiled_graph: Any, *, ticker: str, horizon_days: int, run_id: str | None = None
+    compiled_graph: Any,
+    *,
+    ticker: str,
+    horizon_days: int,
+    run_id: str | None = None,
+    config: dict[str, Any] | None = None,
 ) -> ForecastReport:
     """Convenience wrapper used by both api/main.py and cli/main.py so
     their behavior can never diverge (PRD's own stated goal for the
-    CLI/API split)."""
+    CLI/API split). `config` is forwarded as-is to the graph invocation —
+    e.g. `{"callbacks": [tracer]}` to attach LangSmith tracing for a single
+    request without making it a global default."""
     initial_state = GraphState(ticker=ticker, horizon_days=horizon_days, run_id=run_id or "")
     log_event(
         logger,
@@ -142,7 +160,7 @@ async def run_forecast(
         horizon_days=horizon_days,
         run_id=initial_state.run_id,
     )
-    final_state = await compiled_graph.ainvoke(initial_state)
+    final_state = await compiled_graph.ainvoke(initial_state, config=config)
     report = final_state["report"] if isinstance(final_state, dict) else final_state.report
     if report is None:
         raise RuntimeError("graph completed without producing a ForecastReport")

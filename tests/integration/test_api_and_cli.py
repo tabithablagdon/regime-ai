@@ -156,6 +156,134 @@ async def test_engine_failure_returns_503_not_a_raw_500(monkeypatch):
     assert response.json()["detail"] == ENGINE_UNAVAILABLE_DETAIL
 
 
+async def test_trace_url_is_null_when_langsmith_not_configured(monkeypatch):
+    """No LANGSMITH_API_KEY (the default) must not change forecast behavior
+    at all — tracing is purely opt-in."""
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    monkeypatch.delenv("LANGCHAIN_API_KEY", raising=False)
+    graph = _build_stub_graph()
+    fmp = RecordedFMPClient(FIXTURES_DIR / "fmp")
+
+    async def fake_get_profile(ticker):
+        return {"symbol": ticker}
+
+    monkeypatch.setattr(fmp, "get_profile", fake_get_profile)
+
+    app = create_app(graph=graph, fmp=fmp)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/forecast", json={"ticker": "AAPL"})
+
+    assert response.status_code == 200
+    assert response.json()["trace_url"] is None
+
+
+def test_build_langsmith_tracer_accepts_legacy_langchain_env_names(monkeypatch):
+    """The underlying langsmith client accepts LANGSMITH_* or the legacy
+    LANGCHAIN_* names (it tries LANGSMITH_ first, falls back to LANGCHAIN_)
+    — our own gate has to agree, or it refuses to trace in a setup the
+    client would have happily authenticated."""
+    import equity_ensemble.api.main as api_main
+
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    monkeypatch.delenv("LANGSMITH_PROJECT", raising=False)
+    monkeypatch.setenv("LANGCHAIN_API_KEY", "test-legacy-key")
+    monkeypatch.setenv("LANGCHAIN_PROJECT", "test-legacy-project")
+
+    tracer = api_main._build_langsmith_tracer()
+
+    assert tracer is not None
+    assert tracer.project_name == "test-legacy-project"
+
+
+def test_build_langsmith_tracer_prefers_langsmith_env_names(monkeypatch):
+    import equity_ensemble.api.main as api_main
+
+    monkeypatch.setenv("LANGSMITH_API_KEY", "test-key")
+    monkeypatch.setenv("LANGSMITH_PROJECT", "test-project")
+    monkeypatch.setenv("LANGCHAIN_PROJECT", "should-not-be-used")
+
+    tracer = api_main._build_langsmith_tracer()
+
+    assert tracer is not None
+    assert tracer.project_name == "test-project"
+
+
+def test_build_langsmith_tracer_is_none_with_no_key_configured(monkeypatch):
+    import equity_ensemble.api.main as api_main
+
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    monkeypatch.delenv("LANGCHAIN_API_KEY", raising=False)
+
+    assert api_main._build_langsmith_tracer() is None
+
+
+async def test_trace_url_is_populated_when_langsmith_tracer_available(monkeypatch):
+    """When LangSmith is configured, the response carries this run's own
+    trace URL — what the web UI's "View execution trace" link points at."""
+    from langchain_core.callbacks.base import AsyncCallbackHandler
+
+    import equity_ensemble.api.main as api_main
+
+    class _FakeTracer(AsyncCallbackHandler):
+        """A real callback handler (it gets attached to the actual graph
+        invocation, same as the production tracer) that fakes just the
+        trace-URL lookup."""
+
+        def get_run_url(self) -> str:
+            return "https://smith.langchain.com/o/fake-org/projects/p/fake-project/r/fake-run"
+
+    monkeypatch.setattr(api_main, "_build_langsmith_tracer", lambda: _FakeTracer())
+
+    graph = _build_stub_graph()
+    fmp = RecordedFMPClient(FIXTURES_DIR / "fmp")
+
+    async def fake_get_profile(ticker):
+        return {"symbol": ticker}
+
+    monkeypatch.setattr(fmp, "get_profile", fake_get_profile)
+
+    app = api_main.create_app(graph=graph, fmp=fmp)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/forecast", json={"ticker": "AAPL"})
+
+    assert response.status_code == 200
+    assert response.json()["trace_url"] == (
+        "https://smith.langchain.com/o/fake-org/projects/p/fake-project/r/fake-run"
+    )
+
+
+async def test_trace_url_failure_does_not_break_an_otherwise_successful_forecast(monkeypatch):
+    """A LangSmith hiccup (bad key, project not yet created) must degrade to
+    trace_url=None, never fail the request that otherwise succeeded."""
+    from langchain_core.callbacks.base import AsyncCallbackHandler
+
+    import equity_ensemble.api.main as api_main
+
+    class _FailingTracer(AsyncCallbackHandler):
+        def get_run_url(self) -> str:
+            raise RuntimeError("simulated LangSmith outage")
+
+    monkeypatch.setattr(api_main, "_build_langsmith_tracer", lambda: _FailingTracer())
+
+    graph = _build_stub_graph()
+    fmp = RecordedFMPClient(FIXTURES_DIR / "fmp")
+
+    async def fake_get_profile(ticker):
+        return {"symbol": ticker}
+
+    monkeypatch.setattr(fmp, "get_profile", fake_get_profile)
+
+    app = api_main.create_app(graph=graph, fmp=fmp)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/forecast", json={"ticker": "AAPL"})
+
+    assert response.status_code == 200
+    assert response.json()["trace_url"] is None
+
+
 async def test_unknown_ticker_exits_nonzero_from_cli(tmp_path, monkeypatch):
     from equity_ensemble.data.fmp_client import TickerNotFoundError
 

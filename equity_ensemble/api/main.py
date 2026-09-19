@@ -17,6 +17,7 @@ lifespan hook.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -25,11 +26,52 @@ from pydantic import BaseModel
 
 from equity_ensemble.data.fmp_client import FMPClient, TickerNotFoundError
 from equity_ensemble.graph.build_graph import run_forecast
+from equity_ensemble.logging_config import configure_logging
 from equity_ensemble.render.markdown_report import render_markdown
 
 logger = logging.getLogger(__name__)
 
 ENGINE_UNAVAILABLE_DETAIL = "The analysis engine is not available right now."
+
+
+def _build_langsmith_tracer() -> Any | None:
+    """Attaches LangSmith tracing to a single request rather than relying on
+    the (also-supported) global `LANGSMITH_TRACING=true` env var, so we can
+    grab that request's own trace URL and hand it back to the caller —
+    that's what the web UI's "View execution trace" link points at. Purely
+    opt-in: with no API key set (either name below), this returns None and
+    nothing about a request changes.
+
+    Checks both `LANGSMITH_*` and the legacy `LANGCHAIN_*` env var names —
+    the underlying `langsmith` client already accepts either (it tries
+    `LANGSMITH_` first, falls back to `LANGCHAIN_`); this gate needs to
+    agree with that or it can refuse to trace when the client would have
+    happily authenticated.
+    """
+    api_key = os.environ.get("LANGSMITH_API_KEY") or os.environ.get("LANGCHAIN_API_KEY")
+    if not api_key:
+        return None
+    from langchain_core.tracers.langchain import LangChainTracer
+
+    project = (
+        os.environ.get("LANGSMITH_PROJECT")
+        or os.environ.get("LANGCHAIN_PROJECT")
+        or "equity-ensemble"
+    )
+    return LangChainTracer(project_name=project)
+
+
+def _get_trace_url(tracer: Any | None) -> str | None:
+    if tracer is None:
+        return None
+    try:
+        return tracer.get_run_url()
+    except Exception:
+        # Tracing is a debugging aid, never load-bearing — a LangSmith
+        # hiccup (bad key, project not yet created, network blip) must
+        # never take down a request that otherwise succeeded.
+        logger.warning("could not retrieve LangSmith trace URL", exc_info=True)
+        return None
 
 
 class ForecastRequest(BaseModel):
@@ -55,9 +97,14 @@ def _register_routes(app: FastAPI) -> None:
             logger.exception("ticker validation failed for ticker=%s", ticker)
             raise HTTPException(status_code=503, detail=ENGINE_UNAVAILABLE_DETAIL) from None
 
+        tracer = _build_langsmith_tracer()
+        config = {"callbacks": [tracer]} if tracer else None
         try:
             report = await run_forecast(
-                app.state.graph, ticker=ticker, horizon_days=request.horizon_days
+                app.state.graph,
+                ticker=ticker,
+                horizon_days=request.horizon_days,
+                config=config,
             )
         except Exception:
             # Any failure inside the agent/graph pipeline — an LLM call that
@@ -69,7 +116,11 @@ def _register_routes(app: FastAPI) -> None:
             logger.exception("forecast pipeline failed for ticker=%s", ticker)
             raise HTTPException(status_code=503, detail=ENGINE_UNAVAILABLE_DETAIL) from None
 
-        return {**report.model_dump(mode="json"), "report_markdown": render_markdown(report)}
+        return {
+            **report.model_dump(mode="json"),
+            "report_markdown": render_markdown(report),
+            "trace_url": _get_trace_url(tracer),
+        }
 
 
 def create_app(*, graph: Any, fmp: FMPClient) -> FastAPI:
@@ -84,6 +135,10 @@ def create_app(*, graph: Any, fmp: FMPClient) -> FastAPI:
 @asynccontextmanager
 async def _production_lifespan(app: FastAPI):
     from equity_ensemble.graph.wiring import build_production_graph
+
+    # Runs after uvicorn has installed its own logging config, which would
+    # otherwise swallow every INFO-level agent audit line.
+    configure_logging()
 
     graph, db, fmp = await build_production_graph()
     app.state.graph = graph

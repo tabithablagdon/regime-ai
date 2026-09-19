@@ -8,6 +8,7 @@ from equity_ensemble.data.retrieval import (
     RECENCY_HALF_LIFE_DAYS,
     TOP_K_MAX,
     FakeEmbedder,
+    VoyageEmbedder,
     build_chunks,
     chunk_text,
     cosine_similarity,
@@ -15,6 +16,36 @@ from equity_ensemble.data.retrieval import (
     recency_decay,
 )
 from equity_ensemble.schemas.models import RetrievalChunk
+
+
+def _rate_limit_error() -> Exception:
+    import voyageai
+
+    return voyageai.error.RateLimitError("rate limit: 3 RPM / 10K TPM")
+
+
+async def _record(slept: list[float], delay: float) -> None:
+    """Stands in for `asyncio.sleep` so backoff is asserted, not waited out."""
+    slept.append(delay)
+
+
+class _StubEmbedResponse:
+    def __init__(self, embeddings: list[list[float]]) -> None:
+        self.embeddings = embeddings
+
+
+class _StubVoyageClient:
+    """Returns each scripted response in turn, raising the ones that are
+    exceptions, so a rate limit followed by a success can be replayed."""
+
+    def __init__(self, responses: list) -> None:
+        self._responses = list(responses)
+
+    async def embed(self, texts, *, model, input_type):
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def _chunk(chunk_id: str, embedding: list[float], source_date: date) -> RetrievalChunk:
@@ -174,3 +205,65 @@ class TestBuildChunksMaxChunks:
         )
 
         assert len(chunks) == 1
+
+
+class TestVoyageEmbedderRateLimitRetry:
+    """Voyage's free tier limits by minute, shared across runs, so a burst of
+    forecasts rate-limits a request that would have been fine on its own."""
+
+    @staticmethod
+    def _embedder(*, responses: list, slept: list[float]) -> VoyageEmbedder:
+        embedder = VoyageEmbedder(
+            api_key="test-key",
+            initial_backoff_seconds=20.0,
+            sleep=lambda delay: _record(slept, delay),
+        )
+        embedder._client = _StubVoyageClient(responses)
+        return embedder
+
+    async def test_retries_after_a_rate_limit_then_succeeds(self):
+        slept: list[float] = []
+        embedder = self._embedder(
+            responses=[_rate_limit_error(), _StubEmbedResponse([[0.1, 0.2]])], slept=slept
+        )
+
+        embeddings = await embedder.embed(["chunk one"])
+
+        assert embeddings == [[0.1, 0.2]]
+        assert slept == [20.0]
+
+    async def test_backoff_doubles_between_attempts(self):
+        slept: list[float] = []
+        embedder = self._embedder(
+            responses=[
+                _rate_limit_error(),
+                _rate_limit_error(),
+                _StubEmbedResponse([[0.3]]),
+            ],
+            slept=slept,
+        )
+
+        await embedder.embed(["chunk one"])
+
+        assert slept == [20.0, 40.0]
+
+    async def test_gives_up_after_max_attempts_rather_than_hanging(self):
+        slept: list[float] = []
+        embedder = self._embedder(
+            responses=[_rate_limit_error() for _ in range(5)], slept=slept
+        )
+
+        with pytest.raises(Exception, match="rate limit"):
+            await embedder.embed(["chunk one"])
+
+        # MAX_ATTEMPTS attempts means MAX_ATTEMPTS - 1 waits, bounded.
+        assert len(slept) == VoyageEmbedder.MAX_ATTEMPTS - 1
+
+    async def test_other_errors_are_not_retried(self):
+        slept: list[float] = []
+        embedder = self._embedder(responses=[ValueError("bad request")], slept=slept)
+
+        with pytest.raises(ValueError):
+            await embedder.embed(["chunk one"])
+
+        assert slept == []

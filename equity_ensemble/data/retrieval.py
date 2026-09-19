@@ -9,14 +9,19 @@ chunk's own stored embedding — no change to the Database protocol needed.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import logging
 import os
+from collections.abc import Awaitable, Callable
 from datetime import date
 from typing import Protocol
 
 import numpy as np
 
 from equity_ensemble.schemas.models import RetrievalChunk
+
+logger = logging.getLogger(__name__)
 
 CHUNK_TOKENS = 500
 CHUNK_OVERLAP_TOKENS = 50
@@ -29,17 +34,61 @@ class Embedder(Protocol):
 
 
 class VoyageEmbedder:
-    """Real embedder, wrapping Voyage AI (PRD §5)."""
+    """Real embedder, wrapping Voyage AI (PRD §5).
 
-    def __init__(self, *, api_key: str | None = None, model: str = "voyage-finance-2") -> None:
+    Retries on Voyage's rate limit, because that limit is per minute and
+    shared across runs: the no-payment-method tier allows 3 requests and
+    10K tokens per minute, so back-to-back forecasts exhaust a budget that
+    any single run stays comfortably under. Backoff is therefore measured in
+    tens of seconds (a shorter wait cannot clear a per-minute window) and
+    bounded, so a genuinely exhausted quota still fails rather than hanging
+    past the PRD §11 latency target.
+    """
+
+    MAX_ATTEMPTS = 3
+    INITIAL_BACKOFF_SECONDS = 20.0
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        model: str = "voyage-finance-2",
+        max_attempts: int = MAX_ATTEMPTS,
+        initial_backoff_seconds: float = INITIAL_BACKOFF_SECONDS,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+    ) -> None:
         import voyageai  # local import: keeps voyageai optional for pure unit tests
 
         self._client = voyageai.AsyncClient(api_key=api_key or os.environ["VOYAGE_API_KEY"])
         self._model = model
+        self._max_attempts = max_attempts
+        self._initial_backoff_seconds = initial_backoff_seconds
+        self._sleep = sleep or asyncio.sleep
+        # Held on the instance so `embed` doesn't re-import voyageai per call.
+        self._rate_limit_error = voyageai.error.RateLimitError
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        result = await self._client.embed(texts, model=self._model, input_type="document")
-        return result.embeddings
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                result = await self._client.embed(
+                    texts, model=self._model, input_type="document"
+                )
+                return result.embeddings
+            except self._rate_limit_error:
+                if attempt >= self._max_attempts:
+                    raise
+                delay = self._initial_backoff_seconds * 2 ** (attempt - 1)
+                logger.warning(
+                    "voyage rate limit hit embedding %d chunk(s), attempt %d/%d; "
+                    "retrying in %.0fs",
+                    len(texts),
+                    attempt,
+                    self._max_attempts,
+                    delay,
+                )
+                await self._sleep(delay)
 
 
 class FakeEmbedder:

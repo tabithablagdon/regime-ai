@@ -37,6 +37,17 @@ export function ForecastReportView({ report }: { report: ForecastReport }) {
           <span className="text-sm" style={{ color: "var(--ink-secondary)" }}>
             Overall confidence: {(report.overall_confidence * 100).toFixed(0)}%
           </span>
+          {report.trace_url && (
+            <a
+              href={report.trace_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-sm font-medium underline underline-offset-2"
+              style={{ color: "var(--bullish)" }}
+            >
+              View execution trace ↗
+            </a>
+          )}
         </div>
         {report.escalate_to_analyst && (
           <div
