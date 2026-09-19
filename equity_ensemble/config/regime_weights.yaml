@@ -1,0 +1,28 @@
+# Static, versioned regime-conditioned weight table (PRD §8.4).
+# Keyed by the Technicals agent's regime_label. Checked in, not an env var,
+# so weight changes are code-reviewed. Phase 2 replaces this with weights
+# learned from the backtest log (PRD §15).
+#
+# Weights per regime must sum to 1.0.
+
+Trending Bull:
+  technicals: 0.4
+  fundamentals_sentiment: 0.6
+
+Trending Bear:
+  technicals: 0.4
+  fundamentals_sentiment: 0.6
+
+Mean-Reverting:
+  technicals: 0.4
+  fundamentals_sentiment: 0.6
+
+Volatile/Choppy:
+  technicals: 0.6
+  fundamentals_sentiment: 0.4
+
+# Fallback used if the Technicals agent's claim is unavailable (single-agent
+# mode, PRD §8.1) or reports a regime_label not listed above.
+default:
+  technicals: 0.5
+  fundamentals_sentiment: 0.5

@@ -1,32 +1,36 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
 
-# Test binary, built with `go test -c`
-*.test
+# Virtual environments
+.venv/
+venv/
 
-# Code coverage profiles and other test artifacts
-*.out
+# Dependency lockfile artifacts that are fine to regenerate, not the lockfile itself
+.uv-cache/
+
+# Test / coverage
+.pytest_cache/
+.coverage
 coverage.*
-*.coverprofile
-profile.cov
+htmlcov/
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# Type checkers / linters
+.mypy_cache/
+.ruff_cache/
 
-# Go workspace file
-go.work
-go.work.sum
-
-# env file
+# Env files
 .env
+.env.*
+!.env.example
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+.DS_Store
+
+# Generated forecast output (CLI writes these to the cwd)
+forecast_*.md
+forecast_*.json
