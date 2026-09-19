@@ -37,3 +37,6 @@ forecast_*.json
 
 # make up/down runtime state (pid file, API log)
 .run/
+
+# Coursework write-up, kept local rather than published with the code
+docs/capstone-final-report.md
