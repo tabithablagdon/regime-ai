@@ -12,12 +12,34 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
 
 FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _strip_html_tags(html: str) -> str:
+    """Naive HTML -> text extraction for filing bodies. Good enough to feed
+    the chunker; swap for a real HTML parser (e.g. BeautifulSoup) if section
+    boundaries need to be recovered more precisely than 'whole document'."""
+    return _WHITESPACE_RE.sub(" ", _HTML_TAG_RE.sub(" ", html)).strip()
+
+
+def _parse_fmp_datetime(value: str | None) -> datetime:
+    if not value:
+        return datetime.min.replace(tzinfo=UTC)
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=UTC)
+        except ValueError:
+            continue
+    return datetime.min.replace(tzinfo=UTC)
 
 
 class TickerNotFoundError(RuntimeError):
@@ -47,9 +69,10 @@ class FMPClient(Protocol):
     async def get_filings(
         self, ticker: str, filing_types: tuple[str, ...] = ("10-K", "10-Q", "8-K")
     ) -> list[dict[str, Any]]:
-        """Filing links for the given types (Fundamentals/Sentiment agent,
+        """Filing text for the given types (Fundamentals/Sentiment agent,
         PRD §6.2). Falls back to SEC EDGAR full-text search when a filing
-        isn't mirrored by FMP — implemented by the real client."""
+        isn't mirrored by FMP — implemented by the real client. Each row:
+        `{"type": str, "date": str, "section": str | None, "text": str}`."""
         ...
 
     async def get_news(self, ticker: str, days: int = 14) -> list[dict[str, Any]]:
@@ -103,13 +126,42 @@ class RealFMPClient:
     async def get_filings(
         self, ticker: str, filing_types: tuple[str, ...] = ("10-K", "10-Q", "8-K")
     ) -> list[dict[str, Any]]:
-        raise NotImplementedError("Track B: implement filing-links endpoint + SEC EDGAR fallback")
+        rows = await self._get(f"/sec_filings/{ticker}", type=",".join(filing_types))
+        filings = []
+        for row in rows:
+            if row.get("type") not in filing_types:
+                continue
+            filings.append(await self._parse_filing_row(row))
+        if not filings:
+            raise NotImplementedError(
+                f"FMP has no mirrored {filing_types} filings for {ticker} — implement the "
+                "documented SEC EDGAR full-text-search fallback (PRD §5) here; confirm "
+                "coverage during M2 per PRD §16"
+            )
+        return filings
+
+    async def _parse_filing_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        link = row.get("finalLink") or row.get("link")
+        text = await self._fetch_filing_text(link) if link else ""
+        return {
+            "type": row.get("type"),
+            "date": row.get("fillingDate") or row.get("acceptedDate"),
+            "section": None,
+            "text": text,
+        }
+
+    async def _fetch_filing_text(self, url: str) -> str:
+        resp = await self._client.get(url)
+        resp.raise_for_status()
+        return _strip_html_tags(resp.text)
 
     async def get_news(self, ticker: str, days: int = 14) -> list[dict[str, Any]]:
-        raise NotImplementedError("Track B: implement stock-news endpoint")
+        rows = await self._get("/stock_news", tickers=ticker, limit=100)
+        cutoff = datetime.now(UTC) - timedelta(days=days)
+        return [row for row in rows if _parse_fmp_datetime(row.get("publishedDate")) >= cutoff]
 
     async def get_estimate_revisions(self, ticker: str) -> list[dict[str, Any]]:
-        raise NotImplementedError("Track B: implement consensus estimate revisions endpoint")
+        return await self._get(f"/analyst-estimates/{ticker}", period="quarter")
 
 
 class RecordedFMPClient:
