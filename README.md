@@ -35,6 +35,7 @@ document is the engineering map of what's actually built.
   - [Eval](#eval)
 - [Guardrails](#guardrails)
 - [Running it](#running-it)
+  - [Web UI](#web-ui)
 - [Testing](#testing)
 - [Repository layout](#repository-layout)
 - [Configuration reference](#configuration-reference)
@@ -421,6 +422,25 @@ one-shot command, not a long-running service — but needs the same
 
 Interactive docs are served at `http://127.0.0.1:8000/docs`.
 
+### Web UI
+
+A small Next.js app (`web/`) lets you enter a ticker in a browser instead
+of using `curl` or the CLI:
+
+```bash
+cd web
+npm install
+cp .env.local.example .env.local
+npm run dev
+```
+
+Open `http://localhost:3000`. It talks to the FastAPI backend through a
+server-side proxy route, so start the backend first (`make up`, above). If
+the backend's reasoning pipeline fails for any reason — most commonly,
+`OPENROUTER_API_KEY`/`FMP_API_KEY`/`VOYAGE_API_KEY` not being real keys
+yet — the UI shows a calm "analysis engine unavailable" message instead of
+an error page. See `web/README.md` for details.
+
 ## Testing
 
 ```bash
@@ -468,6 +488,11 @@ tests/
   fixtures/                     # recorded FMP responses, sample filing text
 docker-compose.yml              # local Postgres+pgvector for dev
 Makefile                         # make up / make down / make logs / make status
+web/                             # Next.js web UI (see web/README.md)
+  app/page.tsx                   # the page: form + result rendering
+  app/api/forecast/route.ts      # server-side proxy to the FastAPI backend
+  components/                    # TickerForm, DistributionMeter, ForecastReportView, ...
+  lib/types.ts                   # TypeScript types mirroring schemas/models.py
 ```
 
 ## Configuration reference
