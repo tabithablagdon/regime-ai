@@ -89,10 +89,16 @@ async def build_chunks(
     section: str | None,
     text: str,
     embedder: Embedder,
+    max_chunks: int | None = None,
 ) -> list[RetrievalChunk]:
     """Chunk `text` and embed every chunk, returning ready-to-persist
-    `RetrievalChunk` rows."""
+    `RetrievalChunk` rows. `max_chunks` truncates *before* embedding (not
+    after) — it exists so a caller can bound how many embedding-API tokens
+    a single filing can consume, e.g. to stay under a vendor's free-tier
+    rate limit, without paying for the embeddings it then throws away."""
     texts = chunk_text(text)
+    if max_chunks is not None:
+        texts = texts[:max_chunks]
     if not texts:
         return []
     embeddings = await embedder.embed(texts)

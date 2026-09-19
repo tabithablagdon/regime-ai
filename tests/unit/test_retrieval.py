@@ -8,6 +8,7 @@ from equity_ensemble.data.retrieval import (
     RECENCY_HALF_LIFE_DAYS,
     TOP_K_MAX,
     FakeEmbedder,
+    build_chunks,
     chunk_text,
     cosine_similarity,
     rank_chunks,
@@ -124,3 +125,52 @@ class TestFakeEmbedder:
         embedder = FakeEmbedder(dimension=64)
         [v] = await embedder.embed(["hello world"])
         assert np.linalg.norm(v) == pytest.approx(1.0, abs=1e-6)
+
+
+class TestBuildChunksMaxChunks:
+    async def test_max_chunks_truncates_before_embedding(self):
+        text = " ".join(f"w{i}" for i in range(3000))  # many chunks worth
+        embedder = FakeEmbedder(dimension=8)
+
+        chunks = await build_chunks(
+            ticker="AAPL",
+            source_type="10-Q",
+            source_date=date(2026, 1, 1),
+            section=None,
+            text=text,
+            embedder=embedder,
+            max_chunks=3,
+        )
+
+        assert len(chunks) == 3
+
+    async def test_no_cap_embeds_every_chunk(self):
+        text = " ".join(f"w{i}" for i in range(1200))
+        embedder = FakeEmbedder(dimension=8)
+
+        chunks = await build_chunks(
+            ticker="AAPL",
+            source_type="10-Q",
+            source_date=date(2026, 1, 1),
+            section=None,
+            text=text,
+            embedder=embedder,
+        )
+
+        assert len(chunks) == len(chunk_text(text))
+
+    async def test_cap_larger_than_available_chunks_is_a_no_op(self):
+        text = " ".join(f"w{i}" for i in range(10))
+        embedder = FakeEmbedder(dimension=8)
+
+        chunks = await build_chunks(
+            ticker="AAPL",
+            source_type="10-Q",
+            source_date=date(2026, 1, 1),
+            section=None,
+            text=text,
+            embedder=embedder,
+            max_chunks=100,
+        )
+
+        assert len(chunks) == 1

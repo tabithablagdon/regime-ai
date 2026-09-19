@@ -28,6 +28,17 @@ logger = logging.getLogger(__name__)
 NEWS_LOOKBACK_DAYS = 14
 RETRIEVAL_CANDIDATE_LIMIT = 10
 
+# Bounds embedding-API volume per run (PRD §5.1's cost-visibility concern in
+# practice: Voyage's no-payment-method free tier is 10K tokens/minute, and a
+# single 10-Q can chunk into 30+ pieces on its own). Measured against a real
+# AAPL 10-Q with Voyage's own tokenizer (voyageai.Client().count_tokens):
+# financial filing text runs ~1,100 tokens per 500-word chunk (roughly 2.2x
+# a plain-English word count, not the ~1.3x a naive estimate would assume —
+# dense numbers/terminology tokenize less efficiently). 6 chunks measured at
+# 7,331 tokens, ~27% under the cap; a denser filer could still occasionally
+# exceed it, in which case the run degrades to the standard 503, not a crash.
+MAX_CHUNKS_PER_RUN = 6
+
 NEWS_SENTIMENT_SYSTEM_PROMPT = (
     "You are a financial news sentiment scorer. Score each article's sentiment "
     "toward the company on a 1-100 scale (1=very negative, 50=neutral, "
@@ -61,6 +72,28 @@ def _parse_date(value: Any) -> date:
     if isinstance(value, datetime):
         return value.date()
     return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+
+
+def _select_relevant_filings(filings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """PRD §6.2 Inputs: 'Most recent 10-K and any 10-Q/8-K filed since it' —
+    not every filing FMP's lookback window returns. Keeps ingestion (and
+    embedding volume) bounded to what the claim actually needs rather than
+    growing with however wide the vendor's search window happens to be.
+
+    Returned most-recent-first: `_ingest_filings` spends its chunk budget in
+    this order, and a recent 8-K (a surprise executive departure, a
+    guidance cut) is exactly the kind of disclosure PRD §6.2 wants this
+    agent to catch — it shouldn't lose out on the embedding budget to the
+    much larger, less time-sensitive 10-K just because the 10-K is older.
+    """
+    if not filings:
+        return []
+    by_date_desc = sorted(filings, key=lambda f: _parse_date(f["date"]), reverse=True)
+    ten_ks = [f for f in by_date_desc if f.get("type") == "10-K"]
+    if not ten_ks:
+        return by_date_desc
+    cutoff = _parse_date(ten_ks[0]["date"])  # most recent 10-K comes first, descending
+    return [f for f in by_date_desc if _parse_date(f["date"]) >= cutoff]
 
 
 def _build_retrieval_query(ticker: str, news_scores: list[_NewsSentimentItem]) -> str:
@@ -150,7 +183,10 @@ class FundamentalsSentimentAgent(BaseSpecialistAgent[AgentClaim]):
         return response.items
 
     async def _ingest_filings(self, ticker: str, filings: list[dict[str, Any]]) -> None:
+        remaining = MAX_CHUNKS_PER_RUN
         for filing in filings:
+            if remaining <= 0:
+                break
             text = (filing.get("text") or "").strip()
             if not text:
                 continue
@@ -161,7 +197,9 @@ class FundamentalsSentimentAgent(BaseSpecialistAgent[AgentClaim]):
                 section=filing.get("section"),
                 text=text,
                 embedder=self.embedder,
+                max_chunks=remaining,
             )
+            remaining -= len(chunks)
             if chunks:
                 await self.db.save_chunks(chunks)
 
@@ -179,7 +217,7 @@ class FundamentalsSentimentAgent(BaseSpecialistAgent[AgentClaim]):
         news_scores = await self._score_news(ticker, news_articles)
 
         filings = await self.fmp.get_filings(ticker)
-        await self._ingest_filings(ticker, filings)
+        await self._ingest_filings(ticker, _select_relevant_filings(filings))
 
         query_text = _build_retrieval_query(ticker, news_scores)
         [query_embedding] = await self.embedder.embed([query_text])

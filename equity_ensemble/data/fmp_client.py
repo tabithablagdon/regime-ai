@@ -4,12 +4,18 @@ system uses (PRD §5, §13).
 `FMPClient` is the protocol both specialist agents code against.
 `RecordedFMPClient` replays fixture JSON from `tests/fixtures/fmp/` so Track A
 (Technicals) and Track B (Fundamentals/Sentiment) can be built and tested
-without live API access or quota. `RealFMPClient` is the live implementation,
-filled in as each track needs a specific endpoint.
+without live API access or quota. `RealFMPClient` is the live implementation.
+
+`RealFMPClient` targets FMP's "stable" API (`/stable/...`). FMP retired the
+legacy `/api/v3/...` family on 2025-08-31 for all but grandfathered
+subscriptions — every `/api/v3` call now 403s with "Legacy Endpoint" for a
+new key, which is how this was caught (see the FMP developer docs at
+https://site.financialmodelingprep.com/developer/docs for the current set).
 """
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -19,16 +25,34 @@ from typing import Any, Protocol
 
 import httpx
 
-FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
+FMP_BASE_URL = "https://financialmodelingprep.com/stable"
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
+# Modern SEC filings are inline-XBRL: a large `display:none` block up front
+# holds every tagged fact (fiscal year, CIK, dei:*, us-gaap:* references) as
+# raw, non-prose text. Naive tag-stripping alone leaves this in — it isn't
+# hidden from a regex, only from a renderer — and it can be tens of KB of
+# pure noise sitting before any real content. Strip it before stripping tags.
+_HIDDEN_DIV_RE = re.compile(
+    r'<div[^>]*style="[^"]*display\s*:\s*none[^"]*"[^>]*>.*?</div>',
+    re.DOTALL | re.IGNORECASE,
+)
 
 
-def _strip_html_tags(html: str) -> str:
+def _strip_html_tags(html_text: str) -> str:
     """Naive HTML -> text extraction for filing bodies. Good enough to feed
     the chunker; swap for a real HTML parser (e.g. BeautifulSoup) if section
     boundaries need to be recovered more precisely than 'whole document'."""
-    return _WHITESPACE_RE.sub(" ", _HTML_TAG_RE.sub(" ", html)).strip()
+    cleaned = _HIDDEN_DIV_RE.sub(" ", html_text)
+    cleaned = _HTML_TAG_RE.sub(" ", cleaned)
+    cleaned = html.unescape(cleaned)
+    return _WHITESPACE_RE.sub(" ", cleaned).strip()
+
+
+def _date_range(days_back: int) -> tuple[str, str]:
+    """`(from, to)` ISO date strings for FMP's stable-API date-range params."""
+    today = datetime.now(UTC).date()
+    return (today - timedelta(days=days_back)).isoformat(), today.isoformat()
 
 
 def _parse_fmp_datetime(value: str | None) -> datetime:
@@ -102,20 +126,28 @@ class RealFMPClient:
         return resp.json()
 
     async def get_profile(self, ticker: str) -> dict[str, Any]:
-        data = await self._get(f"/profile/{ticker}")
+        data = await self._get("/profile", symbol=ticker)
         if not data:
             raise TickerNotFoundError(ticker)
         return data[0]
 
     async def get_ohlcv(self, ticker: str, days: int = 504) -> list[dict[str, Any]]:
-        data = await self._get(f"/historical-price-full/{ticker}", timeseries=days)
-        return data.get("historical", [])
+        # Stable API takes a calendar date range, not a trading-day count —
+        # over-fetch a bit (days are trading days, ~252/year) so at least
+        # `days` bars come back after weekends/holidays are excluded.
+        date_from, date_to = _date_range(int(days * 1.5))
+        return await self._get(
+            "/historical-price-eod/full", symbol=ticker, **{"from": date_from, "to": date_to}
+        )
 
     async def get_technical_indicators(
         self, ticker: str, indicator: str, period: int = 14
     ) -> list[dict[str, Any]]:
         return await self._get(
-            f"/technical_indicator/daily/{ticker}", type=indicator, period=period
+            f"/technical-indicators/{indicator}",
+            symbol=ticker,
+            periodLength=period,
+            timeframe="1day",
         )
 
     async def get_options_iv(self, ticker: str) -> dict[str, Any] | None:
@@ -126,10 +158,15 @@ class RealFMPClient:
     async def get_filings(
         self, ticker: str, filing_types: tuple[str, ...] = ("10-K", "10-Q", "8-K")
     ) -> list[dict[str, Any]]:
-        rows = await self._get(f"/sec_filings/{ticker}", type=",".join(filing_types))
+        date_from, date_to = _date_range(730)  # 2 years — comfortably covers 10-Ks + 10-Qs
+        rows = await self._get(
+            "/sec-filings-search/symbol",
+            symbol=ticker,
+            **{"from": date_from, "to": date_to},
+        )
         filings = []
         for row in rows:
-            if row.get("type") not in filing_types:
+            if row.get("formType") not in filing_types:
                 continue
             filings.append(await self._parse_filing_row(row))
         if not filings:
@@ -144,24 +181,31 @@ class RealFMPClient:
         link = row.get("finalLink") or row.get("link")
         text = await self._fetch_filing_text(link) if link else ""
         return {
-            "type": row.get("type"),
-            "date": row.get("fillingDate") or row.get("acceptedDate"),
+            "type": row.get("formType"),
+            "date": row.get("filingDate") or row.get("acceptedDate"),
             "section": None,
             "text": text,
         }
 
     async def _fetch_filing_text(self, url: str) -> str:
-        resp = await self._client.get(url)
+        # SEC EDGAR's fair-access policy 403s any request without a
+        # descriptive User-Agent (name + contact) — httpx's default
+        # ("python-httpx/...") gets blocked. See
+        # https://www.sec.gov/os/webmaster-faq#developers
+        resp = await self._client.get(
+            url,
+            headers={"User-Agent": "equity-ensemble tabitha@helmhealth.com"},
+        )
         resp.raise_for_status()
         return _strip_html_tags(resp.text)
 
     async def get_news(self, ticker: str, days: int = 14) -> list[dict[str, Any]]:
-        rows = await self._get("/stock_news", tickers=ticker, limit=100)
+        rows = await self._get("/news/stock", symbols=ticker, limit=100)
         cutoff = datetime.now(UTC) - timedelta(days=days)
         return [row for row in rows if _parse_fmp_datetime(row.get("publishedDate")) >= cutoff]
 
     async def get_estimate_revisions(self, ticker: str) -> list[dict[str, Any]]:
-        return await self._get(f"/analyst-estimates/{ticker}", period="quarter")
+        return await self._get("/analyst-estimates", symbol=ticker, period="quarter")
 
 
 class RecordedFMPClient:

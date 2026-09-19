@@ -9,6 +9,7 @@ import logging
 from datetime import date
 
 from equity_ensemble.agents.fundamentals_sentiment import (
+    MAX_CHUNKS_PER_RUN,
     FundamentalsSentimentAgent,
     _NewsSentimentItem,
     _NewsSentimentResponse,
@@ -95,6 +96,32 @@ async def test_lowercase_ticker_is_normalized(recorded_fmp, fake_db):
     claim = await agent.run("aapl", horizon_days=21)
 
     assert claim.ticker == "AAPL"
+
+
+async def test_embedding_volume_is_capped_across_all_filings(recorded_fmp, fake_db, monkeypatch):
+    """Regression test for the Voyage free-tier rate limit hit in practice:
+    a run with several large filings must never embed more than
+    MAX_CHUNKS_PER_RUN chunks total, no matter how much text FMP returns."""
+    huge_text = " ".join(f"w{i}" for i in range(5000))  # far more than one filing's worth
+
+    async def many_large_filings(ticker):
+        return [
+            {"type": "10-K", "date": "2025-10-01", "section": None, "text": huge_text},
+            {"type": "8-K", "date": "2025-11-01", "section": None, "text": huge_text},
+            {"type": "10-Q", "date": "2026-01-15", "section": None, "text": huge_text},
+        ]
+
+    monkeypatch.setattr(recorded_fmp, "get_filings", many_large_filings)
+    embedder = FakeEmbedder(dimension=64)
+    llm = FakeLLMClient(responses=[_scripted_news_scores(), _scripted_claim()])
+    agent = FundamentalsSentimentAgent(llm, recorded_fmp, fake_db, embedder)
+
+    await agent.run("AAPL", horizon_days=21)
+
+    stored = await fake_db.search_chunks("AAPL", [0.0] * 64, limit=100)
+    assert len(stored) == MAX_CHUNKS_PER_RUN
+    # budget spent on the most recent filing first, not the oldest
+    assert stored[0].source_type == "10-Q"
 
 
 async def test_no_news_falls_back_to_generic_retrieval_query(recorded_fmp, fake_db, monkeypatch):
