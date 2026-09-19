@@ -9,17 +9,21 @@ price-momentum-driven initial read.
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from equity_ensemble.agents.base import BaseSpecialistAgent, run_with_validation_retry
+from equity_ensemble.agents.trace import log_event, summarize_claim, summarize_evidence
 from equity_ensemble.data.fmp_client import FMPClient
 from equity_ensemble.data.retrieval import Embedder, build_chunks, rank_chunks
 from equity_ensemble.llm.client import LLMClient
 from equity_ensemble.persistence.db import Database
 from equity_ensemble.schemas.models import AgentClaim, RetrievalChunk
+
+logger = logging.getLogger(__name__)
 
 NEWS_LOOKBACK_DAYS = 14
 RETRIEVAL_CANDIDATE_LIMIT = 10
@@ -114,6 +118,15 @@ class FundamentalsSentimentAgent(BaseSpecialistAgent[AgentClaim]):
         self, ticker: str, articles: list[dict[str, Any]]
     ) -> list[_NewsSentimentItem]:
         if not articles:
+            log_event(
+                logger,
+                "fundamentals_sentiment",
+                "thinking",
+                ticker=ticker,
+                step="news_sentiment",
+                article_count=0,
+                scores=[],
+            )
             return []
         article_lines = "\n".join(
             f"- [{a.get('publishedDate', 'unknown date')}] {a.get('title', '')}: "
@@ -124,6 +137,15 @@ class FundamentalsSentimentAgent(BaseSpecialistAgent[AgentClaim]):
             system_prompt=NEWS_SENTIMENT_SYSTEM_PROMPT,
             user_prompt=f"Ticker: {ticker}\n\n{article_lines}",
             response_model=_NewsSentimentResponse,
+        )
+        log_event(
+            logger,
+            "fundamentals_sentiment",
+            "thinking",
+            ticker=ticker,
+            step="news_sentiment",
+            article_count=len(articles),
+            scores=[f"{item.title}:{item.sentiment}" for item in response.items],
         )
         return response.items
 
@@ -145,6 +167,13 @@ class FundamentalsSentimentAgent(BaseSpecialistAgent[AgentClaim]):
 
     async def run(self, ticker: str, horizon_days: int) -> AgentClaim:
         ticker = ticker.upper()
+        log_event(
+            logger,
+            "fundamentals_sentiment",
+            "called",
+            ticker=ticker,
+            horizon_days=horizon_days,
+        )
 
         news_articles = await self.fmp.get_news(ticker, days=NEWS_LOOKBACK_DAYS)
         news_scores = await self._score_news(ticker, news_articles)
@@ -158,6 +187,19 @@ class FundamentalsSentimentAgent(BaseSpecialistAgent[AgentClaim]):
             ticker, query_embedding, limit=RETRIEVAL_CANDIDATE_LIMIT
         )
         top_chunks = rank_chunks(query_embedding, candidates)
+        log_event(
+            logger,
+            "fundamentals_sentiment",
+            "thinking",
+            ticker=ticker,
+            step="filing_retrieval",
+            query=query_text,
+            candidate_count=len(candidates),
+            top_chunks=[
+                f"{chunk.source_type}:{chunk.section or 'n/a'}({chunk.source_date.isoformat()})"
+                for chunk in top_chunks
+            ],
+        )
 
         try:
             estimate_revisions = await self.fmp.get_estimate_revisions(ticker)
@@ -178,5 +220,17 @@ class FundamentalsSentimentAgent(BaseSpecialistAgent[AgentClaim]):
             system_prompt=FUNDAMENTALS_SYSTEM_PROMPT,
             build_user_prompt=build_user_prompt,
             response_model=AgentClaim,
+            agent="fundamentals_sentiment",
+            ticker=ticker,
         )
-        return claim.model_copy(update={"agent": "fundamentals_sentiment", "ticker": ticker})
+        claim = claim.model_copy(update={"agent": "fundamentals_sentiment", "ticker": ticker})
+        log_event(
+            logger,
+            "fundamentals_sentiment",
+            "decision",
+            ticker=ticker,
+            claim=summarize_claim(claim),
+            falsifiers=claim.falsifiers,
+            evidence=summarize_evidence(claim),
+        )
+        return claim

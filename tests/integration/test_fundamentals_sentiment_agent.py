@@ -5,6 +5,7 @@ evidence — without any live FMP, Voyage, or LLM access."""
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 from equity_ensemble.agents.fundamentals_sentiment import (
@@ -54,10 +55,11 @@ def _scripted_claim() -> AgentClaim:
     )
 
 
-async def test_returns_schema_valid_claim(recorded_fmp, fake_db):
+async def test_returns_schema_valid_claim(recorded_fmp, fake_db, caplog):
     embedder = FakeEmbedder(dimension=64)
     llm = FakeLLMClient(responses=[_scripted_news_scores(), _scripted_claim()])
     agent = FundamentalsSentimentAgent(llm, recorded_fmp, fake_db, embedder)
+    caplog.set_level(logging.INFO)
 
     claim = await agent.run("AAPL", horizon_days=21)
 
@@ -67,6 +69,10 @@ async def test_returns_schema_valid_claim(recorded_fmp, fake_db):
     assert claim.sentiment_score == 35
     assert claim.key_risk_flags == ["guidance_cut"]
     assert len(claim.evidence) >= 1
+    assert "fundamentals_sentiment called ticker=AAPL horizon_days=21" in caplog.text
+    assert "step=news_sentiment" in caplog.text
+    assert "step=filing_retrieval" in caplog.text
+    assert "fundamentals_sentiment decision ticker=AAPL" in caplog.text
 
 
 async def test_ingests_filing_chunks_into_the_database(recorded_fmp, fake_db):

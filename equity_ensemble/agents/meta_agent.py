@@ -10,6 +10,7 @@ require Track A or Track B to be finished.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -19,8 +20,11 @@ import numpy as np
 import yaml
 from pydantic import BaseModel
 
+from equity_ensemble.agents.trace import log_event, summarize_claim
 from equity_ensemble.llm.client import LLMClient
 from equity_ensemble.schemas.models import AgentClaim, Distribution, Evidence, ForecastReport
+
+logger = logging.getLogger(__name__)
 
 CONFLICT_CONFIDENCE_THRESHOLD = 0.5
 DEFAULT_REGIME_WEIGHTS_PATH = Path(__file__).resolve().parents[1] / "config" / "regime_weights.yaml"
@@ -71,6 +75,28 @@ def check_conflict(technicals: AgentClaim, fundamentals: AgentClaim) -> bool:
     return opposed and both_confident
 
 
+def _conflict_reason(technicals: AgentClaim, fundamentals: AgentClaim) -> str:
+    opposed = {technicals.direction, fundamentals.direction} == {"bullish", "bearish"}
+    both_confident = (
+        technicals.confidence > CONFLICT_CONFIDENCE_THRESHOLD
+        and fundamentals.confidence > CONFLICT_CONFIDENCE_THRESHOLD
+    )
+    if opposed and both_confident:
+        return (
+            f"opposed directions ({technicals.direction} vs {fundamentals.direction}) "
+            f"and both confidences above {CONFLICT_CONFIDENCE_THRESHOLD}"
+        )
+    if opposed:
+        return (
+            f"directions oppose ({technicals.direction} vs {fundamentals.direction}) "
+            f"but at least one confidence is at or below {CONFLICT_CONFIDENCE_THRESHOLD}"
+        )
+    return (
+        f"directions do not oppose "
+        f"({technicals.direction} vs {fundamentals.direction})"
+    )
+
+
 def _critique_prompt(*, own: AgentClaim, other: AgentClaim) -> str:
     other_evidence = "\n".join(f"- {e.source} ({e.date}): {e.snippet}" for e in other.evidence)
     return (
@@ -113,6 +139,17 @@ async def run_critique_round(
         f"(confidence={revised_fundamentals.confidence}, "
         f"magnitude_bps={revised_fundamentals.magnitude_bps})",
     ]
+    log_event(
+        logger,
+        "meta_agent",
+        "thinking",
+        ticker=technicals.ticker,
+        step="critique_round",
+        pre_technicals=summarize_claim(technicals),
+        pre_fundamentals=summarize_claim(fundamentals),
+        post_technicals=summarize_claim(revised_technicals),
+        post_fundamentals=summarize_claim(revised_fundamentals),
+    )
     return revised_technicals, revised_fundamentals, critique_log
 
 
@@ -242,6 +279,14 @@ async def generate_rationale(
         user_prompt="\n".join(lines),
         response_model=_ThesisResponse,
     )
+    log_event(
+        logger,
+        "meta_agent",
+        "thinking",
+        ticker=ticker,
+        step="rationale",
+        thesis=response.thesis,
+    )
     return response.thesis
 
 
@@ -270,27 +315,88 @@ class MetaAgent:
         if not original_claims:
             raise ValueError("MetaAgent.run requires at least one available agent claim")
 
+        log_event(
+            logger,
+            "meta_agent",
+            "called",
+            ticker=ticker,
+            horizon_days=horizon_days,
+            technicals=summarize_claim(technicals),
+            fundamentals=summarize_claim(fundamentals),
+        )
+
         critique_log: list[str] = []
         escalation_reasons: list[str] = []
         fitting_technicals, fitting_fundamentals = technicals, fundamentals
 
         if technicals is None or fundamentals is None:
             missing = "technicals" if technicals is None else "fundamentals_sentiment"
-            escalation_reasons.append(
-                f"{missing} claim unavailable; report generated in single-agent mode"
+            reason = f"{missing} claim unavailable; report generated in single-agent mode"
+            escalation_reasons.append(reason)
+            log_event(
+                logger,
+                "meta_agent",
+                "thinking",
+                ticker=ticker,
+                step="conflict_check",
+                conflict=False,
+                reason=reason,
             )
-        elif check_conflict(technicals, fundamentals):
-            fitting_technicals, fitting_fundamentals, critique_log = await run_critique_round(
-                self.llm, technicals, fundamentals
+        else:
+            conflict = check_conflict(technicals, fundamentals)
+            reason = _conflict_reason(technicals, fundamentals)
+            log_event(
+                logger,
+                "meta_agent",
+                "thinking",
+                ticker=ticker,
+                step="conflict_check",
+                conflict=conflict,
+                reason=reason,
             )
-            if check_conflict(fitting_technicals, fitting_fundamentals):
-                escalation_reasons.append(
-                    "agents materially disagree even after the single critique round"
+            if conflict:
+                fitting_technicals, fitting_fundamentals, critique_log = await run_critique_round(
+                    self.llm, technicals, fundamentals
+                )
+                still_conflict = check_conflict(fitting_technicals, fitting_fundamentals)
+                if still_conflict:
+                    escalation_reasons.append(
+                        "agents materially disagree even after the single critique round"
+                    )
+                log_event(
+                    logger,
+                    "meta_agent",
+                    "thinking",
+                    ticker=ticker,
+                    step="post_critique_conflict",
+                    conflict=still_conflict,
+                    reason=_conflict_reason(fitting_technicals, fitting_fundamentals),
                 )
 
         regime_label = technicals.regime_label if technicals is not None else None
         weights = resolve_weights(regime_label)
+        log_event(
+            logger,
+            "meta_agent",
+            "thinking",
+            ticker=ticker,
+            step="weights",
+            regime=regime_label,
+            weights=weights,
+        )
         distribution = fit_distribution(fitting_technicals, fitting_fundamentals, weights)
+        log_event(
+            logger,
+            "meta_agent",
+            "thinking",
+            ticker=ticker,
+            step="distribution",
+            bullish_pct=distribution.bullish_pct,
+            neutral_pct=distribution.neutral_pct,
+            bearish_pct=distribution.bearish_pct,
+            fitting_technicals=summarize_claim(fitting_technicals),
+            fitting_fundamentals=summarize_claim(fitting_fundamentals),
+        )
 
         fitting_claims = [c for c in (fitting_technicals, fitting_fundamentals) if c is not None]
         overall_confidence = sum(c.confidence for c in fitting_claims) / len(fitting_claims)
@@ -302,6 +408,18 @@ class MetaAgent:
 
         escalate = bool(escalation_reasons)
         recommendation = _recommendation(distribution, escalate=escalate)
+        log_event(
+            logger,
+            "meta_agent",
+            "thinking",
+            ticker=ticker,
+            step="escalation",
+            escalate=escalate,
+            overall_confidence=overall_confidence,
+            threshold=self.confidence_escalation_threshold,
+            reasons=escalation_reasons or ["none"],
+            recommendation=recommendation,
+        )
 
         thesis = await generate_rationale(
             self.llm,
@@ -312,7 +430,7 @@ class MetaAgent:
             critique_log=critique_log,
         )
 
-        return ForecastReport(
+        report = ForecastReport(
             run_id=uuid4(),
             ticker=ticker,
             horizon_days=horizon_days,
@@ -327,3 +445,21 @@ class MetaAgent:
             critique_log=critique_log,
             citations=_dedupe_citations(original_claims),
         )
+        log_event(
+            logger,
+            "meta_agent",
+            "decision",
+            ticker=ticker,
+            run_id=report.run_id,
+            recommendation=report.recommendation,
+            overall_confidence=report.overall_confidence,
+            escalate_to_analyst=report.escalate_to_analyst,
+            escalation_reason=report.escalation_reason,
+            distribution=(
+                f"bullish={distribution.bullish_pct:.1f},"
+                f"neutral={distribution.neutral_pct:.1f},"
+                f"bearish={distribution.bearish_pct:.1f}"
+            ),
+            thesis=report.thesis,
+        )
+        return report

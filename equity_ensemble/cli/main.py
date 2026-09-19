@@ -13,6 +13,8 @@ Typer `run` command just wires production dependencies around it.
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -25,10 +27,22 @@ from equity_ensemble.render.markdown_report import render_markdown
 app = typer.Typer()
 
 
+def _configure_logging() -> None:
+    """CLI has no uvicorn logging defaults — make agent audit lines visible."""
+    if logging.getLogger().handlers:
+        return
+    level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
 @app.callback()
 def _cli() -> None:
     """Keeps `run` addressed as an explicit subcommand (`forecast run AAPL`,
     PRD §10.2) instead of Typer's single-command shortcut collapsing it."""
+    _configure_logging()
 
 
 async def run_forecast_and_write(ticker: str, horizon: int, *, graph: Any, fmp: FMPClient) -> str:

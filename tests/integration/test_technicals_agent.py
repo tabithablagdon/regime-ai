@@ -4,6 +4,7 @@ AgentClaim with regime_label set — without any live FMP or LLM access."""
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 from equity_ensemble.agents.technicals import TechnicalsAgent
@@ -27,9 +28,10 @@ def _scripted_claim() -> AgentClaim:
     )
 
 
-async def test_returns_schema_valid_claim_with_computed_regime(recorded_fmp, fake_db):
+async def test_returns_schema_valid_claim_with_computed_regime(recorded_fmp, fake_db, caplog):
     llm = FakeLLMClient(responses=[_scripted_claim()])
     agent = TechnicalsAgent(llm, recorded_fmp, fake_db)
+    caplog.set_level(logging.INFO)
 
     claim = await agent.run("AAPL", horizon_days=21)
 
@@ -40,6 +42,9 @@ async def test_returns_schema_valid_claim_with_computed_regime(recorded_fmp, fak
     # above its 50-day SMA, so the deterministic classifier must say Bull —
     # regardless of what the (irrelevant, scripted) LLM response claimed.
     assert claim.regime_label == "Trending Bull"
+    assert "technicals called ticker=AAPL horizon_days=21" in caplog.text
+    assert "step=regime_classification" in caplog.text
+    assert "technicals decision ticker=AAPL" in caplog.text
 
 
 async def test_no_prior_regime_means_no_transition(recorded_fmp, fake_db):

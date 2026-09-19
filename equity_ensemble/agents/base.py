@@ -8,15 +8,19 @@ instead of three copies.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Generic, TypeVar
 
 from pydantic import BaseModel
 
+from equity_ensemble.agents.trace import log_event
 from equity_ensemble.llm.client import LLMClient, LLMError
 
 ClaimT = TypeVar("ClaimT", bound=BaseModel)
+
+logger = logging.getLogger(__name__)
 
 
 class AgentUnavailable(Exception):
@@ -45,6 +49,8 @@ async def run_with_validation_retry(
     system_prompt: str,
     build_user_prompt: Callable[[str | None], str],
     response_model: type[ClaimT],
+    agent: str = "unknown",
+    ticker: str = "UNKNOWN",
 ) -> ClaimT:
     """PRD §8.1 retry policy: one retry with the validation error appended
     to context; a second failure raises `AgentUnavailable`.
@@ -59,6 +65,14 @@ async def run_with_validation_retry(
             response_model=response_model,
         )
     except LLMError as first_error:
+        log_event(
+            logger,
+            agent,
+            "retry",
+            ticker=ticker,
+            reason=str(first_error),
+            response_model=response_model.__name__,
+        )
         try:
             return await llm.complete_structured(
                 system_prompt=system_prompt,
@@ -66,6 +80,14 @@ async def run_with_validation_retry(
                 response_model=response_model,
             )
         except LLMError as second_error:
+            log_event(
+                logger,
+                agent,
+                "unavailable",
+                ticker=ticker,
+                reason=str(second_error),
+                response_model=response_model.__name__,
+            )
             raise AgentUnavailable(
                 f"{response_model.__name__} failed schema validation twice"
             ) from second_error

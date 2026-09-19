@@ -9,15 +9,19 @@ being returned, so a mismatched narration can't silently corrupt the claim).
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 import numpy as np
 
 from equity_ensemble.agents.base import BaseSpecialistAgent, run_with_validation_retry
+from equity_ensemble.agents.trace import log_event, summarize_claim, summarize_evidence
 from equity_ensemble.data.fmp_client import FMPClient
 from equity_ensemble.llm.client import LLMClient
 from equity_ensemble.persistence.db import Database
 from equity_ensemble.schemas.models import AgentClaim
+
+logger = logging.getLogger(__name__)
 
 REGIME_LABELS = ("Trending Bull", "Trending Bear", "Mean-Reverting", "Volatile/Choppy")
 
@@ -88,6 +92,9 @@ class TechnicalsAgent(BaseSpecialistAgent[AgentClaim]):
 
     async def run(self, ticker: str, horizon_days: int) -> AgentClaim:
         ticker = ticker.upper()
+        log_event(
+            logger, "technicals", "called", ticker=ticker, horizon_days=horizon_days
+        )
         previous_regime = await self.db.get_last_regime(ticker)
 
         ohlcv = await self.fmp.get_ohlcv(ticker)
@@ -124,6 +131,22 @@ class TechnicalsAgent(BaseSpecialistAgent[AgentClaim]):
             price_vs_moving_average_pct=pct_vs_sma,
         )
         regime_changed = previous_regime is not None and previous_regime != regime_label
+        log_event(
+            logger,
+            "technicals",
+            "thinking",
+            ticker=ticker,
+            step="regime_classification",
+            previous_regime=previous_regime,
+            regime=regime_label,
+            regime_changed=regime_changed,
+            close=latest_close,
+            adx=latest_adx,
+            sma=latest_sma,
+            price_vs_sma_pct=pct_vs_sma,
+            realized_vol=volatility,
+            options_iv=options_iv,
+        )
         await self.db.save_regime(ticker, date.today(), regime_label)
 
         def build_user_prompt(previous_error: str | None) -> str:
@@ -152,11 +175,13 @@ class TechnicalsAgent(BaseSpecialistAgent[AgentClaim]):
             system_prompt=TECHNICALS_SYSTEM_PROMPT,
             build_user_prompt=build_user_prompt,
             response_model=AgentClaim,
+            agent="technicals",
+            ticker=ticker,
         )
 
         # The regime is computed in code, not by the LLM (PRD §6.1) — enforce
         # that guarantee rather than merely requesting it in the prompt.
-        return claim.model_copy(
+        claim = claim.model_copy(
             update={
                 "agent": "technicals",
                 "ticker": ticker,
@@ -164,3 +189,13 @@ class TechnicalsAgent(BaseSpecialistAgent[AgentClaim]):
                 "regime_changed": regime_changed,
             }
         )
+        log_event(
+            logger,
+            "technicals",
+            "decision",
+            ticker=ticker,
+            claim=summarize_claim(claim),
+            falsifiers=claim.falsifiers,
+            evidence=summarize_evidence(claim),
+        )
+        return claim

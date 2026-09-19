@@ -25,6 +25,7 @@ degradation for a single failed agent.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import uuid4
@@ -32,7 +33,10 @@ from uuid import uuid4
 from langgraph.graph import END, START, StateGraph
 
 from equity_ensemble.agents.base import AgentUnavailable
+from equity_ensemble.agents.trace import log_event
 from equity_ensemble.schemas.models import AgentClaim, ForecastReport
+
+logger = logging.getLogger(__name__)
 
 
 class SpecialistCallable(Protocol):
@@ -77,6 +81,14 @@ def build_graph(
         try:
             claim = await technicals_agent(state.ticker, state.horizon_days)
         except AgentUnavailable:
+            log_event(
+                logger,
+                "technicals",
+                "unavailable",
+                ticker=state.ticker,
+                horizon_days=state.horizon_days,
+                run_id=state.run_id,
+            )
             claim = None
         return {"technicals_claim": claim}
 
@@ -84,6 +96,14 @@ def build_graph(
         try:
             claim = await fundamentals_agent(state.ticker, state.horizon_days)
         except AgentUnavailable:
+            log_event(
+                logger,
+                "fundamentals_sentiment",
+                "unavailable",
+                ticker=state.ticker,
+                horizon_days=state.horizon_days,
+                run_id=state.run_id,
+            )
             claim = None
         return {"fundamentals_claim": claim}
 
@@ -114,8 +134,26 @@ async def run_forecast(
     their behavior can never diverge (PRD's own stated goal for the
     CLI/API split)."""
     initial_state = GraphState(ticker=ticker, horizon_days=horizon_days, run_id=run_id or "")
+    log_event(
+        logger,
+        "forecast",
+        "called",
+        ticker=ticker,
+        horizon_days=horizon_days,
+        run_id=initial_state.run_id,
+    )
     final_state = await compiled_graph.ainvoke(initial_state)
     report = final_state["report"] if isinstance(final_state, dict) else final_state.report
     if report is None:
         raise RuntimeError("graph completed without producing a ForecastReport")
+    log_event(
+        logger,
+        "forecast",
+        "decision",
+        ticker=ticker,
+        run_id=report.run_id,
+        recommendation=report.recommendation,
+        overall_confidence=report.overall_confidence,
+        escalate_to_analyst=report.escalate_to_analyst,
+    )
     return report

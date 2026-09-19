@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from equity_ensemble.agents.meta_agent import (
@@ -176,3 +178,50 @@ class TestMetaAgentRun:
         report = await meta.run("AAPL", 21, t, f)
 
         assert len(report.citations) == 1
+
+    async def test_logs_call_thinking_and_decision(
+        self, technicals_claim_factory, fundamentals_claim_factory, caplog
+    ):
+        t = technicals_claim_factory(direction="bullish", confidence=0.8)
+        f = fundamentals_claim_factory(direction="bullish", confidence=0.8)
+        thesis = "Both agents agree on upside."
+        llm = FakeLLMClient(responses=[_ThesisResponse(thesis=thesis)])
+
+        caplog.set_level(logging.INFO)
+        meta = MetaAgent(llm)
+        report = await meta.run("AAPL", 21, t, f)
+
+        assert "meta_agent called ticker=AAPL" in caplog.text
+        assert "step=conflict_check" in caplog.text
+        assert "conflict=false" in caplog.text
+        assert "step=weights" in caplog.text
+        assert "step=distribution" in caplog.text
+        assert "step=escalation" in caplog.text
+        assert "step=rationale" in caplog.text
+        assert f"thesis={thesis}" in caplog.text
+        assert "meta_agent decision ticker=AAPL" in caplog.text
+        assert f"recommendation={report.recommendation}" in caplog.text
+
+    async def test_logs_critique_reasoning_when_agents_conflict(
+        self, technicals_claim_factory, fundamentals_claim_factory, caplog
+    ):
+        t = technicals_claim_factory(direction="bullish", confidence=0.8)
+        f = fundamentals_claim_factory(direction="bearish", confidence=0.8)
+        revised_t = technicals_claim_factory(direction="neutral", confidence=0.5)
+        revised_f = fundamentals_claim_factory(direction="neutral", confidence=0.5)
+        llm = FakeLLMClient(
+            responses=[
+                revised_t,
+                revised_f,
+                _ThesisResponse(thesis="Agents converged after reviewing counter-evidence."),
+            ]
+        )
+
+        caplog.set_level(logging.INFO)
+        await MetaAgent(llm).run("AAPL", 21, t, f)
+
+        assert "step=conflict_check conflict=true" in caplog.text
+        assert "step=critique_round" in caplog.text
+        assert "pre_technicals=" in caplog.text
+        assert "post_technicals=" in caplog.text
+        assert "step=post_critique_conflict" in caplog.text
