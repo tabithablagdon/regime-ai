@@ -34,6 +34,16 @@ class Database(Protocol):
         """Persist filing/news chunks + embeddings (retrieval log, PRD §4.1)."""
         ...
 
+    async def existing_chunk_ids(self, chunk_ids: list[str]) -> set[str]:
+        """Which of `chunk_ids` are already stored.
+
+        Lets an ingest skip text it has embedded before. `chunk_id` is
+        deterministic, so without this check a repeat forecast for the same
+        ticker pays the embedding vendor for vectors that `save_chunks`'s ON
+        CONFLICT clause then throws away.
+        """
+        ...
+
     async def search_chunks(
         self, ticker: str, query_embedding: list[float], limit: int = 10
     ) -> list[RetrievalChunk]:
@@ -82,6 +92,9 @@ class FakeDatabase:
 
     async def save_chunks(self, chunks: list[RetrievalChunk]) -> None:
         self._chunks.extend(chunks)
+
+    async def existing_chunk_ids(self, chunk_ids: list[str]) -> set[str]:
+        return {c.chunk_id for c in self._chunks} & set(chunk_ids)
 
     async def search_chunks(
         self, ticker: str, query_embedding: list[float], limit: int = 10
@@ -178,6 +191,16 @@ class PostgresDatabase:
                     for c in chunks
                 ],
             )
+
+    async def existing_chunk_ids(self, chunk_ids: list[str]) -> set[str]:
+        if not chunk_ids:
+            return set()
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT chunk_id FROM filing_chunks WHERE chunk_id = ANY($1)",
+                list(chunk_ids),
+            )
+        return {row["chunk_id"] for row in rows}
 
     async def search_chunks(
         self, ticker: str, query_embedding: list[float], limit: int = 10

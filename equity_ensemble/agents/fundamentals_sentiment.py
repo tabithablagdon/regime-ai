@@ -18,7 +18,13 @@ from pydantic import BaseModel, Field
 from equity_ensemble.agents.base import BaseSpecialistAgent, run_with_validation_retry
 from equity_ensemble.agents.trace import log_event, summarize_claim, summarize_evidence
 from equity_ensemble.data.fmp_client import FMPClient
-from equity_ensemble.data.retrieval import Embedder, build_chunks, rank_chunks
+from equity_ensemble.data.retrieval import (
+    Embedder,
+    PendingChunk,
+    embed_chunks,
+    plan_chunks,
+    rank_chunks,
+)
 from equity_ensemble.llm.client import LLMClient
 from equity_ensemble.persistence.db import Database
 from equity_ensemble.schemas.models import AgentClaim, RetrievalChunk
@@ -37,6 +43,8 @@ RETRIEVAL_CANDIDATE_LIMIT = 10
 # dense numbers/terminology tokenize less efficiently). 6 chunks measured at
 # 7,331 tokens, ~27% under the cap; a denser filer could still occasionally
 # exceed it, in which case the run degrades to the standard 503, not a crash.
+# This bounds tokens only. The same tier caps *requests* at 3/minute, which
+# `_ingest_filings` handles by embedding its whole batch in one call.
 MAX_CHUNKS_PER_RUN = 6
 
 NEWS_SENTIMENT_SYSTEM_PROMPT = (
@@ -183,6 +191,17 @@ class FundamentalsSentimentAgent(BaseSpecialistAgent[AgentClaim]):
         return response.items
 
     async def _ingest_filings(self, ticker: str, filings: list[dict[str, Any]]) -> None:
+        """Plans chunks across every filing first, then embeds what's missing
+        in one call.
+
+        Two properties matter for staying inside Voyage's free tier, which
+        caps requests per minute as well as tokens. Planning across all
+        filings before embedding makes the whole ingest one request instead
+        of one per filing. Filtering against chunks already stored makes a
+        repeat forecast for the same ticker cost zero requests, since the
+        filing text and its deterministic `chunk_id`s have not changed.
+        """
+        pending: list[PendingChunk] = []
         remaining = MAX_CHUNKS_PER_RUN
         for filing in filings:
             if remaining <= 0:
@@ -190,18 +209,35 @@ class FundamentalsSentimentAgent(BaseSpecialistAgent[AgentClaim]):
             text = (filing.get("text") or "").strip()
             if not text:
                 continue
-            chunks = await build_chunks(
+            planned = plan_chunks(
                 ticker=ticker,
                 source_type=filing["type"],
                 source_date=_parse_date(filing["date"]),
                 section=filing.get("section"),
                 text=text,
-                embedder=self.embedder,
                 max_chunks=remaining,
             )
-            remaining -= len(chunks)
-            if chunks:
-                await self.db.save_chunks(chunks)
+            pending.extend(planned)
+            remaining -= len(planned)
+
+        # The budget deliberately isn't re-spent on further filings when
+        # chunks are skipped: reusing it would mean a warm ticker embeds six
+        # *new* chunks on every run and never gets cheap.
+        already_stored = await self.db.existing_chunk_ids([p.chunk_id for p in pending])
+        new_chunks = await embed_chunks(
+            [p for p in pending if p.chunk_id not in already_stored], embedder=self.embedder
+        )
+        await self.db.save_chunks(new_chunks)
+        log_event(
+            logger,
+            "fundamentals_sentiment",
+            "thinking",
+            ticker=ticker,
+            step="filing_ingest",
+            planned=len(pending),
+            embedded=len(new_chunks),
+            reused=len(already_stored),
+        )
 
     async def run(self, ticker: str, horizon_days: int) -> AgentClaim:
         ticker = ticker.upper()
@@ -220,7 +256,7 @@ class FundamentalsSentimentAgent(BaseSpecialistAgent[AgentClaim]):
         await self._ingest_filings(ticker, _select_relevant_filings(filings))
 
         query_text = _build_retrieval_query(ticker, news_scores)
-        [query_embedding] = await self.embedder.embed([query_text])
+        [query_embedding] = await self.embedder.embed([query_text], input_type="query")
         candidates = await self.db.search_chunks(
             ticker, query_embedding, limit=RETRIEVAL_CANDIDATE_LIMIT
         )

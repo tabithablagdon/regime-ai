@@ -97,6 +97,29 @@ class TestFilingChunks:
 
         assert [c.chunk_id for c in results] == ["aapl-1"]
 
+    async def test_existing_chunk_ids_reports_only_what_is_stored(self, postgres_db):
+        """Drives the ingest's skip-what-we-have check, so the `= ANY($1)`
+        lookup is exercised against real Postgres rather than only the fake."""
+        stored = RetrievalChunk(
+            chunk_id="AAPL:10-K:2026-01-01:0",
+            ticker="AAPL",
+            source_type="10-K",
+            source_date=date(2026, 1, 1),
+            section=None,
+            text="already ingested",
+            embedding=_vector(1024, {0: 1.0}),
+        )
+        await postgres_db.save_chunks([stored])
+
+        found = await postgres_db.existing_chunk_ids(
+            [stored.chunk_id, "AAPL:10-K:2026-01-01:1"]
+        )
+
+        assert found == {stored.chunk_id}
+
+    async def test_existing_chunk_ids_handles_an_empty_request(self, postgres_db):
+        assert await postgres_db.existing_chunk_ids([]) == set()
+
 
 class TestForecasts:
     def _report(self) -> ForecastReport:

@@ -14,6 +14,7 @@ import hashlib
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import date
 from typing import Protocol
 
@@ -30,7 +31,9 @@ RECENCY_HALF_LIFE_DAYS = 90
 
 
 class Embedder(Protocol):
-    async def embed(self, texts: list[str]) -> list[list[float]]: ...
+    async def embed(
+        self, texts: list[str], *, input_type: str = "document"
+    ) -> list[list[float]]: ...
 
 
 class VoyageEmbedder:
@@ -67,13 +70,21 @@ class VoyageEmbedder:
         # Held on the instance so `embed` doesn't re-import voyageai per call.
         self._rate_limit_error = voyageai.error.RateLimitError
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    async def embed(
+        self, texts: list[str], *, input_type: str = "document"
+    ) -> list[list[float]]:
+        """`input_type` must be `"query"` when embedding a search query.
+        voyage-finance-2 is an asymmetric model: it encodes queries and
+        documents into deliberately different regions of the space, so
+        embedding a query as a document compares it against the corpus on
+        the wrong footing and quietly degrades relevance.
+        """
         attempt = 0
         while True:
             attempt += 1
             try:
                 result = await self._client.embed(
-                    texts, model=self._model, input_type="document"
+                    texts, model=self._model, input_type=input_type
                 )
                 return result.embeddings
             except self._rate_limit_error:
@@ -100,7 +111,12 @@ class FakeEmbedder:
     def __init__(self, dimension: int = 1024) -> None:
         self.dimension = dimension
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    async def embed(
+        self, texts: list[str], *, input_type: str = "document"
+    ) -> list[list[float]]:
+        # `input_type` is accepted for protocol compatibility and ignored:
+        # ranking tests need a query and an identical document to produce
+        # the same vector so they can assert exact similarity scores.
         return [self._embed_one(t) for t in texts]
 
     def _embed_one(self, text: str) -> list[float]:
@@ -130,6 +146,81 @@ def chunk_text(
     return chunks
 
 
+@dataclass(frozen=True)
+class PendingChunk:
+    """A chunk that has been split and identified but not yet embedded.
+
+    Splitting is local and free; embedding is a metered network call. Naming
+    the chunk before embedding it is what lets a caller decide *not* to
+    embed — `chunk_id` is deterministic, so chunks already in the database
+    can be filtered out first rather than re-embedded and then discarded by
+    `save_chunks`'s ON CONFLICT clause.
+    """
+
+    chunk_id: str
+    ticker: str
+    source_type: str
+    source_date: date
+    section: str | None
+    text: str
+
+
+def plan_chunks(
+    *,
+    ticker: str,
+    source_type: str,
+    source_date: date,
+    section: str | None,
+    text: str,
+    max_chunks: int | None = None,
+) -> list[PendingChunk]:
+    """Split `text` into identified-but-unembedded chunks. `max_chunks`
+    truncates here, before any embedding is paid for."""
+    texts = chunk_text(text)
+    if max_chunks is not None:
+        texts = texts[:max_chunks]
+    return [
+        PendingChunk(
+            chunk_id=f"{ticker}:{source_type}:{source_date.isoformat()}:{i}",
+            ticker=ticker,
+            source_type=source_type,
+            source_date=source_date,
+            section=section,
+            text=chunk,
+        )
+        for i, chunk in enumerate(texts)
+    ]
+
+
+async def embed_chunks(
+    pending: list[PendingChunk], *, embedder: Embedder
+) -> list[RetrievalChunk]:
+    """Embed every pending chunk in a *single* embedder call, returning
+    ready-to-persist rows.
+
+    One call for the whole batch rather than one per source, because vendors
+    meter request count as well as tokens: Voyage's no-payment-method tier
+    allows only 3 requests per minute, so a run ingesting three filings
+    could exhaust the quota on request count alone while sitting well under
+    the token cap. Batching is what keeps a multi-source run under it.
+    """
+    if not pending:
+        return []
+    embeddings = await embedder.embed([p.text for p in pending], input_type="document")
+    return [
+        RetrievalChunk(
+            chunk_id=p.chunk_id,
+            ticker=p.ticker,
+            source_type=p.source_type,
+            source_date=p.source_date,
+            section=p.section,
+            text=p.text,
+            embedding=embedding,
+        )
+        for p, embedding in zip(pending, embeddings, strict=True)
+    ]
+
+
 async def build_chunks(
     *,
     ticker: str,
@@ -141,28 +232,22 @@ async def build_chunks(
     max_chunks: int | None = None,
 ) -> list[RetrievalChunk]:
     """Chunk `text` and embed every chunk, returning ready-to-persist
-    `RetrievalChunk` rows. `max_chunks` truncates *before* embedding (not
-    after) — it exists so a caller can bound how many embedding-API tokens
-    a single filing can consume, e.g. to stay under a vendor's free-tier
-    rate limit, without paying for the embeddings it then throws away."""
-    texts = chunk_text(text)
-    if max_chunks is not None:
-        texts = texts[:max_chunks]
-    if not texts:
-        return []
-    embeddings = await embedder.embed(texts)
-    return [
-        RetrievalChunk(
-            chunk_id=f"{ticker}:{source_type}:{source_date.isoformat()}:{i}",
-            ticker=ticker,
-            source_type=source_type,
-            source_date=source_date,
-            section=section,
-            text=chunk,
-            embedding=embedding,
-        )
-        for i, (chunk, embedding) in enumerate(zip(texts, embeddings, strict=True))
-    ]
+    `RetrievalChunk` rows.
+
+    Single-source convenience wrapper over `plan_chunks` + `embed_chunks`. A
+    caller ingesting *several* sources should plan across all of them and
+    call `embed_chunks` once instead, so the run costs one embedding request
+    rather than one per source.
+    """
+    pending = plan_chunks(
+        ticker=ticker,
+        source_type=source_type,
+        source_date=source_date,
+        section=section,
+        text=text,
+        max_chunks=max_chunks,
+    )
+    return await embed_chunks(pending, embedder=embedder)
 
 
 def recency_decay(

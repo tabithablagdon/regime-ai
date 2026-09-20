@@ -12,6 +12,8 @@ from equity_ensemble.data.retrieval import (
     build_chunks,
     chunk_text,
     cosine_similarity,
+    embed_chunks,
+    plan_chunks,
     rank_chunks,
     recency_decay,
 )
@@ -205,6 +207,57 @@ class TestBuildChunksMaxChunks:
         )
 
         assert len(chunks) == 1
+
+
+class TestPlanAndEmbedSplit:
+    """`plan_chunks` must stay free of network calls so a caller can drop
+    chunks it already has before paying to embed them, and `embed_chunks`
+    must batch whatever survives into one request."""
+
+    def _plan(self, *, text: str, max_chunks: int | None = None):
+        return plan_chunks(
+            ticker="AAPL",
+            source_type="10-K",
+            source_date=date(2026, 1, 1),
+            section="Risk Factors",
+            text=text,
+            max_chunks=max_chunks,
+        )
+
+    def test_planning_assigns_deterministic_ids(self):
+        text = " ".join(["word"] * 1200)
+
+        first = self._plan(text=text)
+        second = self._plan(text=text)
+
+        assert [p.chunk_id for p in first] == [p.chunk_id for p in second]
+        assert first[0].chunk_id == "AAPL:10-K:2026-01-01:0"
+
+    def test_planning_truncates_before_embedding(self):
+        planned = self._plan(text=" ".join(["word"] * 5000), max_chunks=2)
+
+        assert len(planned) == 2
+
+    async def test_embedding_a_batch_issues_one_call(self):
+        calls: list[int] = []
+
+        class _Recorder:
+            async def embed(self, texts, *, input_type="document"):
+                calls.append(len(texts))
+                return [[0.0] * 8 for _ in texts]
+
+        planned = self._plan(text=" ".join(["word"] * 3000))
+        chunks = await embed_chunks(planned, embedder=_Recorder())
+
+        assert calls == [len(planned)]
+        assert [c.chunk_id for c in chunks] == [p.chunk_id for p in planned]
+
+    async def test_empty_batch_never_touches_the_embedder(self):
+        class _Explode:
+            async def embed(self, texts, *, input_type="document"):
+                raise AssertionError("must not embed an empty batch")
+
+        assert await embed_chunks([], embedder=_Explode()) == []
 
 
 class TestVoyageEmbedderRateLimitRetry:
