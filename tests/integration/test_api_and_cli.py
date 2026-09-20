@@ -5,7 +5,7 @@ wired to the same compiled graph."""
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -16,6 +16,7 @@ from equity_ensemble.api.main import create_app
 from equity_ensemble.cli.main import run_forecast_and_write
 from equity_ensemble.data.fmp_client import RecordedFMPClient
 from equity_ensemble.graph.build_graph import build_graph
+from equity_ensemble.persistence.db import FakeDatabase
 from equity_ensemble.schemas.models import AgentClaim, Distribution, Evidence, ForecastReport
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
@@ -39,7 +40,7 @@ def _canned_report() -> ForecastReport:
         run_id=_CANNED_RUN_ID,
         ticker="AAPL",
         horizon_days=21,
-        generated_at=datetime(2026, 1, 1, 12, 0, 0),
+        generated_at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
         distribution=Distribution(bullish_pct=55, neutral_pct=30, bearish_pct=15),
         recommendation="bullish_lean",
         overall_confidence=0.7,
@@ -60,6 +61,25 @@ def _build_stub_graph():
 
     async def meta(ticker, horizon_days, technicals_claim, fundamentals_claim):
         return _canned_report()
+
+    return build_graph(
+        technicals_agent=technicals, fundamentals_agent=fundamentals, meta_agent=meta
+    )
+
+
+def _build_refusing_graph():
+    """A graph whose nodes fail the test if ever invoked — proves a cache
+    hit short-circuits before the pipeline runs at all, not just before
+    the LLM call within it."""
+
+    async def technicals(ticker, horizon_days):
+        raise AssertionError("technicals ran on what should have been a cache hit")
+
+    async def fundamentals(ticker, horizon_days):
+        raise AssertionError("fundamentals ran on what should have been a cache hit")
+
+    async def meta(ticker, horizon_days, technicals_claim, fundamentals_claim):
+        raise AssertionError("meta_agent ran on what should have been a cache hit")
 
     return build_graph(
         technicals_agent=technicals, fundamentals_agent=fundamentals, meta_agent=meta
@@ -282,6 +302,76 @@ async def test_trace_url_failure_does_not_break_an_otherwise_successful_forecast
 
     assert response.status_code == 200
     assert response.json()["trace_url"] is None
+
+
+async def test_fresh_forecast_via_api_is_persisted_and_marked_not_cached(monkeypatch):
+    db = FakeDatabase()
+    graph = _build_stub_graph()
+    fmp = RecordedFMPClient(FIXTURES_DIR / "fmp")
+
+    async def fake_get_profile(ticker):
+        return {"symbol": ticker}
+
+    monkeypatch.setattr(fmp, "get_profile", fake_get_profile)
+
+    app = create_app(graph=graph, fmp=fmp, db=db)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/forecast", json={"ticker": "AAPL", "horizon_days": 21})
+
+    assert response.status_code == 200
+    assert response.json()["cached"] is False
+    # Persisted (PRD §4.2 audit trail) — checked directly rather than via
+    # get_recent_forecast, since _canned_report()'s fixed timestamp is
+    # deliberately outside the 24h window (age-window behavior itself is
+    # covered by tests/unit/test_db.py and TestForecastCaching).
+    assert await db.get_forecast(str(_CANNED_RUN_ID)) is not None
+
+
+async def test_api_serves_a_cached_forecast_without_running_agents(monkeypatch):
+    db = FakeDatabase()
+    cached_report = _canned_report().model_copy(update={"generated_at": datetime.now(UTC)})
+    await db.save_forecast(cached_report)
+
+    graph = _build_refusing_graph()  # would fail the test if the pipeline ran
+    fmp = RecordedFMPClient(FIXTURES_DIR / "fmp")
+
+    async def fake_get_profile(ticker):
+        return {"symbol": ticker}
+
+    monkeypatch.setattr(fmp, "get_profile", fake_get_profile)
+
+    app = create_app(graph=graph, fmp=fmp, db=db)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/forecast", json={"ticker": "AAPL", "horizon_days": 21})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["cached"] is True
+    assert body["run_id"] == str(cached_report.run_id)
+    # No graph invocation happened, so nothing was ever traced.
+    assert body["trace_url"] is None
+
+
+async def test_cli_serves_a_cached_forecast_without_running_agents(tmp_path, monkeypatch):
+    db = FakeDatabase()
+    cached_report = _canned_report().model_copy(update={"generated_at": datetime.now(UTC)})
+    await db.save_forecast(cached_report)
+
+    graph = _build_refusing_graph()
+    fmp = RecordedFMPClient(FIXTURES_DIR / "fmp")
+
+    async def fake_get_profile(ticker):
+        return {"symbol": ticker}
+
+    monkeypatch.setattr(fmp, "get_profile", fake_get_profile)
+    monkeypatch.chdir(tmp_path)
+
+    markdown = await run_forecast_and_write("AAPL", 21, graph=graph, fmp=fmp, db=db)
+
+    assert cached_report.thesis in markdown
+    assert (tmp_path / f"forecast_AAPL_{cached_report.run_id}.md").exists()
 
 
 async def test_unknown_ticker_exits_nonzero_from_cli(tmp_path, monkeypatch):

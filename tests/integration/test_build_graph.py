@@ -5,13 +5,14 @@ synthesize node receives whatever the fan-out produced."""
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from uuid import uuid4
 
 import pytest
 
 from equity_ensemble.agents.base import AgentUnavailable
 from equity_ensemble.graph.build_graph import build_graph, run_forecast
+from equity_ensemble.persistence.db import FakeDatabase
 from equity_ensemble.schemas.models import AgentClaim, Distribution, Evidence, ForecastReport
 
 
@@ -27,9 +28,9 @@ def _claim(agent: str) -> AgentClaim:
     )
 
 
-def _report() -> ForecastReport:
+def _report(**overrides) -> ForecastReport:
     claim = _claim("technicals")
-    return ForecastReport(
+    defaults = dict(
         run_id=uuid4(),
         ticker="AAPL",
         horizon_days=21,
@@ -41,6 +42,8 @@ def _report() -> ForecastReport:
         thesis="Stub thesis.",
         agent_claims=[claim],
     )
+    defaults.update(overrides)
+    return ForecastReport(**defaults)
 
 
 async def test_both_specialists_succeed_and_reach_synthesis():
@@ -60,9 +63,10 @@ async def test_both_specialists_succeed_and_reach_synthesis():
     graph = build_graph(
         technicals_agent=technicals, fundamentals_agent=fundamentals, meta_agent=meta
     )
-    report = await run_forecast(graph, ticker="AAPL", horizon_days=21)
+    result = await run_forecast(graph, ticker="AAPL", horizon_days=21)
 
-    assert isinstance(report, ForecastReport)
+    assert isinstance(result.report, ForecastReport)
+    assert result.cache_hit is False
     assert seen["technicals"].agent == "technicals"
     assert seen["fundamentals"].agent == "fundamentals_sentiment"
 
@@ -84,9 +88,9 @@ async def test_one_agent_unavailable_degrades_to_none_not_a_crash():
     graph = build_graph(
         technicals_agent=technicals, fundamentals_agent=fundamentals, meta_agent=meta
     )
-    report = await run_forecast(graph, ticker="AAPL", horizon_days=21)
+    result = await run_forecast(graph, ticker="AAPL", horizon_days=21)
 
-    assert isinstance(report, ForecastReport)
+    assert isinstance(result.report, ForecastReport)
     assert seen["technicals"] is None
     assert seen["fundamentals"].agent == "fundamentals_sentiment"
 
@@ -111,9 +115,9 @@ async def test_vendor_failure_degrades_to_single_agent_mode(caplog):
         technicals_agent=technicals, fundamentals_agent=fundamentals, meta_agent=meta
     )
     caplog.set_level(logging.INFO)
-    report = await run_forecast(graph, ticker="AAPL", horizon_days=21)
+    result = await run_forecast(graph, ticker="AAPL", horizon_days=21)
 
-    assert isinstance(report, ForecastReport)
+    assert isinstance(result.report, ForecastReport)
     assert seen["fundamentals"] is None
     assert seen["technicals"].agent == "technicals"
     assert "fundamentals_sentiment unavailable ticker=AAPL" in caplog.text
@@ -153,6 +157,179 @@ async def test_run_forecast_defaults_config_to_none():
     await run_forecast(fake_graph, ticker="AAPL", horizon_days=21)
 
     assert fake_graph.received_config is None
+
+
+class TestForecastCaching:
+    """A repeat request for the same (ticker, horizon_days) within 24h must
+    skip the whole pipeline — no LLM, FMP, or embedding calls — and a fresh
+    run must persist so a later request can find it."""
+
+    def _refusing_agents(self):
+        """Agents that fail the test if the graph is ever actually invoked
+        — proves a cache hit short-circuits before the graph runs at all,
+        not just before the LLM call within it."""
+
+        async def technicals(ticker, horizon_days):
+            raise AssertionError("technicals ran on what should have been a cache hit")
+
+        async def fundamentals(ticker, horizon_days):
+            raise AssertionError("fundamentals ran on what should have been a cache hit")
+
+        async def meta(ticker, horizon_days, t, f):
+            raise AssertionError("meta_agent ran on what should have been a cache hit")
+
+        return technicals, fundamentals, meta
+
+    async def test_recent_forecast_is_served_from_cache_without_running_the_graph(self):
+        db = FakeDatabase()
+        cached = _report(ticker="AAPL", horizon_days=21, generated_at=datetime.now(UTC))
+        await db.save_forecast(cached)
+
+        technicals, fundamentals, meta = self._refusing_agents()
+        graph = build_graph(
+            technicals_agent=technicals, fundamentals_agent=fundamentals, meta_agent=meta
+        )
+
+        result = await run_forecast(graph, ticker="AAPL", horizon_days=21, db=db)
+
+        assert result.cache_hit is True
+        assert result.report.run_id == cached.run_id
+
+    async def test_fresh_run_is_persisted_for_a_later_cache_hit(self):
+        db = FakeDatabase()
+
+        async def technicals(ticker, horizon_days):
+            return _claim("technicals")
+
+        async def fundamentals(ticker, horizon_days):
+            return _claim("fundamentals_sentiment")
+
+        async def meta(ticker, horizon_days, t, f):
+            return _report(ticker=ticker, horizon_days=horizon_days, generated_at=datetime.now(UTC))
+
+        real_graph = build_graph(
+            technicals_agent=technicals, fundamentals_agent=fundamentals, meta_agent=meta
+        )
+        first = await run_forecast(real_graph, ticker="AAPL", horizon_days=21, db=db)
+        assert first.cache_hit is False
+
+        # A second call, wired to agents that fail if ever invoked — this
+        # only passes if the fresh run above was actually persisted and the
+        # cache check finds it, short-circuiting before the graph runs.
+        refusing_technicals, refusing_fundamentals, refusing_meta = self._refusing_agents()
+        refusing_graph = build_graph(
+            technicals_agent=refusing_technicals,
+            fundamentals_agent=refusing_fundamentals,
+            meta_agent=refusing_meta,
+        )
+        second = await run_forecast(refusing_graph, ticker="AAPL", horizon_days=21, db=db)
+
+        assert second.cache_hit is True
+        assert second.report.run_id == first.report.run_id
+
+    async def test_cached_report_older_than_max_age_is_not_used(self):
+        db = FakeDatabase()
+        stale = _report(
+            ticker="AAPL",
+            horizon_days=21,
+            generated_at=datetime(2020, 1, 1, 12, 0, 0, tzinfo=UTC),
+        )
+        await db.save_forecast(stale)
+
+        async def technicals(ticker, horizon_days):
+            return _claim("technicals")
+
+        async def fundamentals(ticker, horizon_days):
+            return _claim("fundamentals_sentiment")
+
+        fresh = _report(ticker="AAPL", horizon_days=21, generated_at=datetime.now(UTC))
+
+        async def meta(ticker, horizon_days, t, f):
+            return fresh
+
+        graph = build_graph(
+            technicals_agent=technicals, fundamentals_agent=fundamentals, meta_agent=meta
+        )
+        result = await run_forecast(graph, ticker="AAPL", horizon_days=21, db=db)
+
+        assert result.cache_hit is False
+        assert result.report.run_id == fresh.run_id
+
+    async def test_cache_key_includes_horizon_days(self):
+        db = FakeDatabase()
+        await db.save_forecast(
+            _report(ticker="AAPL", horizon_days=21, generated_at=datetime.now(UTC))
+        )
+
+        async def technicals(ticker, horizon_days):
+            return _claim("technicals")
+
+        async def fundamentals(ticker, horizon_days):
+            return _claim("fundamentals_sentiment")
+
+        fresh = _report(ticker="AAPL", horizon_days=5)
+
+        async def meta(ticker, horizon_days, t, f):
+            return fresh
+
+        graph = build_graph(
+            technicals_agent=technicals, fundamentals_agent=fundamentals, meta_agent=meta
+        )
+        # Different horizon than what's cached -> must not hit the cache.
+        result = await run_forecast(graph, ticker="AAPL", horizon_days=5, db=db)
+
+        assert result.cache_hit is False
+        assert result.report.run_id == fresh.run_id
+
+    async def test_cache_max_age_none_disables_the_cache_check(self):
+        db = FakeDatabase()
+        cached = _report(ticker="AAPL", horizon_days=21, generated_at=datetime.now(UTC))
+        await db.save_forecast(cached)
+
+        async def technicals(ticker, horizon_days):
+            return _claim("technicals")
+
+        async def fundamentals(ticker, horizon_days):
+            return _claim("fundamentals_sentiment")
+
+        fresh = _report(ticker="AAPL", horizon_days=21)
+
+        async def meta(ticker, horizon_days, t, f):
+            return fresh
+
+        graph = build_graph(
+            technicals_agent=technicals, fundamentals_agent=fundamentals, meta_agent=meta
+        )
+        result = await run_forecast(
+            graph, ticker="AAPL", horizon_days=21, db=db, cache_max_age=None
+        )
+
+        assert result.cache_hit is False
+        assert result.report.run_id == fresh.run_id
+
+    async def test_no_db_means_no_caching_and_no_persistence(self):
+        """Existing callers that never pass `db` (most of this file's other
+        tests) must be completely unaffected — this is the regression
+        guard for that."""
+
+        async def technicals(ticker, horizon_days):
+            return _claim("technicals")
+
+        async def fundamentals(ticker, horizon_days):
+            return _claim("fundamentals_sentiment")
+
+        async def meta(ticker, horizon_days, t, f):
+            return _report()
+
+        graph = build_graph(
+            technicals_agent=technicals, fundamentals_agent=fundamentals, meta_agent=meta
+        )
+
+        first = await run_forecast(graph, ticker="AAPL", horizon_days=21)
+        second = await run_forecast(graph, ticker="AAPL", horizon_days=21)
+
+        assert first.cache_hit is False
+        assert second.cache_hit is False
 
 
 async def test_both_agents_unavailable_propagates_meta_agents_error():

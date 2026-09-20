@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -35,9 +36,12 @@ from langgraph.graph import END, START, StateGraph
 
 from equity_ensemble.agents.base import AgentUnavailable
 from equity_ensemble.agents.trace import log_event
+from equity_ensemble.persistence.db import Database
 from equity_ensemble.schemas.models import AgentClaim, ForecastReport
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_CACHE_MAX_AGE = timedelta(hours=24)
 
 
 class SpecialistCallable(Protocol):
@@ -138,6 +142,12 @@ def build_graph(
     return graph.compile()
 
 
+@dataclass
+class ForecastResult:
+    report: ForecastReport
+    cache_hit: bool
+
+
 async def run_forecast(
     compiled_graph: Any,
     *,
@@ -145,12 +155,40 @@ async def run_forecast(
     horizon_days: int,
     run_id: str | None = None,
     config: dict[str, Any] | None = None,
-) -> ForecastReport:
+    db: Database | None = None,
+    cache_max_age: timedelta | None = DEFAULT_CACHE_MAX_AGE,
+) -> ForecastResult:
     """Convenience wrapper used by both api/main.py and cli/main.py so
     their behavior can never diverge (PRD's own stated goal for the
     CLI/API split). `config` is forwarded as-is to the graph invocation —
     e.g. `{"callbacks": [tracer]}` to attach LangSmith tracing for a single
-    request without making it a global default."""
+    request without making it a global default.
+
+    `db` is optional (tests that don't care about persistence just omit
+    it, unchanged from before this existed). When given, two things happen
+    around the graph invocation rather than inside it:
+
+    1. Before: a forecast for this exact (ticker, horizon_days) generated
+       within `cache_max_age` short-circuits the whole pipeline — no LLM,
+       FMP, or embedding calls — and that cached report is returned as-is.
+       Pass `cache_max_age=None` to persist without ever reading the cache.
+    2. After a fresh run: the report is persisted (PRD §4.2's full audit
+       trail requirement), which is also what makes the cache above have
+       anything to find on a later call.
+    """
+    if db is not None and cache_max_age is not None:
+        cached = await db.get_recent_forecast(ticker, horizon_days, max_age=cache_max_age)
+        if cached is not None:
+            log_event(
+                logger,
+                "forecast",
+                "cache_hit",
+                ticker=ticker,
+                run_id=cached.run_id,
+                generated_at=cached.generated_at.isoformat(),
+            )
+            return ForecastResult(report=cached, cache_hit=True)
+
     initial_state = GraphState(ticker=ticker, horizon_days=horizon_days, run_id=run_id or "")
     log_event(
         logger,
@@ -174,4 +212,8 @@ async def run_forecast(
         overall_confidence=report.overall_confidence,
         escalate_to_analyst=report.escalate_to_analyst,
     )
-    return report
+
+    if db is not None:
+        await db.save_forecast(report)
+
+    return ForecastResult(report=report, cache_hit=False)

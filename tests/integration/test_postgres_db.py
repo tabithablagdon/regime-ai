@@ -6,7 +6,7 @@ if no instance is reachable (see conftest.py)."""
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from uuid import uuid4
 
 from equity_ensemble.schemas.models import (
@@ -184,3 +184,80 @@ class TestForecasts:
             as_of=report.generated_at.date() + timedelta(days=report.horizon_days + 1)
         )
         assert report.run_id not in {r.run_id for r in still_due}
+
+
+class TestGetRecentForecast:
+    """Backs the 24h result cache (equity_ensemble.graph.build_graph.run_forecast)."""
+
+    def _report(self, *, ticker: str, horizon_days: int, generated_at: datetime) -> ForecastReport:
+        claim = AgentClaim(
+            agent="technicals",
+            ticker=ticker,
+            direction="bullish",
+            magnitude_bps=100,
+            confidence=0.6,
+            evidence=[Evidence(source="test", date=date(2026, 1, 1), snippet="...")],
+            falsifiers=["reversal"],
+        )
+        return ForecastReport(
+            run_id=uuid4(),
+            ticker=ticker,
+            horizon_days=horizon_days,
+            generated_at=generated_at,
+            distribution=Distribution(bullish_pct=50, neutral_pct=30, bearish_pct=20),
+            recommendation="bullish_lean",
+            overall_confidence=0.6,
+            escalate_to_analyst=False,
+            thesis="Stub thesis.",
+            agent_claims=[claim],
+        )
+
+    async def test_no_match_returns_none(self, postgres_db):
+        result = await postgres_db.get_recent_forecast("AAPL", 21, max_age=timedelta(hours=24))
+        assert result is None
+
+    async def test_finds_a_recent_forecast(self, postgres_db):
+        report = self._report(
+            ticker="AAPL", horizon_days=21, generated_at=datetime.now(UTC)
+        )
+        await postgres_db.save_forecast(report)
+
+        found = await postgres_db.get_recent_forecast("AAPL", 21, max_age=timedelta(hours=24))
+
+        assert found is not None
+        assert found.run_id == report.run_id
+
+    async def test_forecast_older_than_max_age_is_excluded(self, postgres_db):
+        old = datetime.now(UTC) - timedelta(hours=25)
+        await postgres_db.save_forecast(
+            self._report(ticker="AAPL", horizon_days=21, generated_at=old)
+        )
+
+        found = await postgres_db.get_recent_forecast("AAPL", 21, max_age=timedelta(hours=24))
+
+        assert found is None
+
+    async def test_different_horizon_days_is_excluded(self, postgres_db):
+        await postgres_db.save_forecast(
+            self._report(ticker="AAPL", horizon_days=21, generated_at=datetime.now(UTC))
+        )
+
+        found = await postgres_db.get_recent_forecast("AAPL", 5, max_age=timedelta(hours=24))
+
+        assert found is None
+
+    async def test_returns_the_most_recent_match(self, postgres_db):
+        now = datetime.now(UTC)
+        older = self._report(
+            ticker="AAPL", horizon_days=21, generated_at=now - timedelta(hours=10)
+        )
+        newer = self._report(
+            ticker="AAPL", horizon_days=21, generated_at=now - timedelta(hours=1)
+        )
+        await postgres_db.save_forecast(older)
+        await postgres_db.save_forecast(newer)
+
+        found = await postgres_db.get_recent_forecast("AAPL", 21, max_age=timedelta(hours=24))
+
+        assert found is not None
+        assert found.run_id == newer.run_id

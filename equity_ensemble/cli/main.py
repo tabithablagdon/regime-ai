@@ -21,6 +21,7 @@ import typer
 from equity_ensemble.data.fmp_client import FMPClient, TickerNotFoundError
 from equity_ensemble.graph.build_graph import run_forecast
 from equity_ensemble.logging_config import configure_logging
+from equity_ensemble.persistence.db import Database
 from equity_ensemble.render.markdown_report import render_markdown
 
 app = typer.Typer()
@@ -33,14 +34,23 @@ def _cli() -> None:
     configure_logging()
 
 
-async def run_forecast_and_write(ticker: str, horizon: int, *, graph: Any, fmp: FMPClient) -> str:
+async def run_forecast_and_write(
+    ticker: str, horizon: int, *, graph: Any, fmp: FMPClient, db: Database | None = None
+) -> str:
     ticker = ticker.upper()
     try:
         await fmp.get_profile(ticker)
     except TickerNotFoundError as exc:
         raise typer.BadParameter(f"unknown or unsupported ticker: {ticker}") from exc
 
-    report = await run_forecast(graph, ticker=ticker, horizon_days=horizon)
+    result = await run_forecast(graph, ticker=ticker, horizon_days=horizon, db=db)
+    report = result.report
+    if result.cache_hit:
+        typer.echo(
+            f"Using a cached report generated {report.generated_at.isoformat()} "
+            "(< 24h old) — skipping the agent pipeline.",
+            err=True,
+        )
     markdown = render_markdown(report)
 
     Path(f"forecast_{ticker}_{report.run_id}.md").write_text(markdown)
@@ -53,7 +63,7 @@ async def _run_with_production_deps(ticker: str, horizon: int) -> None:
 
     graph, db, fmp = await build_production_graph()
     try:
-        markdown = await run_forecast_and_write(ticker, horizon, graph=graph, fmp=fmp)
+        markdown = await run_forecast_and_write(ticker, horizon, graph=graph, fmp=fmp, db=db)
         typer.echo(markdown)
     finally:
         await db.close()

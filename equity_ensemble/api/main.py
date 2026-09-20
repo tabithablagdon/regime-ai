@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from equity_ensemble.data.fmp_client import FMPClient, TickerNotFoundError
 from equity_ensemble.graph.build_graph import run_forecast
 from equity_ensemble.logging_config import configure_logging
+from equity_ensemble.persistence.db import Database
 from equity_ensemble.render.markdown_report import render_markdown
 
 logger = logging.getLogger(__name__)
@@ -100,11 +101,12 @@ def _register_routes(app: FastAPI) -> None:
         tracer = _build_langsmith_tracer()
         config = {"callbacks": [tracer]} if tracer else None
         try:
-            report = await run_forecast(
+            result = await run_forecast(
                 app.state.graph,
                 ticker=ticker,
                 horizon_days=request.horizon_days,
                 config=config,
+                db=app.state.db,
             )
         except Exception:
             # Any failure inside the agent/graph pipeline — an LLM call that
@@ -116,18 +118,27 @@ def _register_routes(app: FastAPI) -> None:
             logger.exception("forecast pipeline failed for ticker=%s", ticker)
             raise HTTPException(status_code=503, detail=ENGINE_UNAVAILABLE_DETAIL) from None
 
+        report = result.report
+        # A cache hit never invoked the graph, so no run was ever traced —
+        # skip the lookup rather than pay get_run_url()'s retry/backoff on a
+        # trace that was never going to exist.
+        trace_url = None if result.cache_hit else _get_trace_url(tracer)
         return {
             **report.model_dump(mode="json"),
             "report_markdown": render_markdown(report),
-            "trace_url": _get_trace_url(tracer),
+            "trace_url": trace_url,
+            "cached": result.cache_hit,
         }
 
 
-def create_app(*, graph: Any, fmp: FMPClient) -> FastAPI:
-    """Testable factory: pass pre-built (possibly stub) dependencies."""
+def create_app(*, graph: Any, fmp: FMPClient, db: Database | None = None) -> FastAPI:
+    """Testable factory: pass pre-built (possibly stub) dependencies. `db`
+    is optional — omit it (as existing tests do) to disable the 24h result
+    cache and the audit-trail persistence it depends on."""
     app = FastAPI(title="Equity Forecast Ensemble", version="0.1.0")
     app.state.graph = graph
     app.state.fmp = fmp
+    app.state.db = db
     _register_routes(app)
     return app
 
@@ -143,6 +154,7 @@ async def _production_lifespan(app: FastAPI):
     graph, db, fmp = await build_production_graph()
     app.state.graph = graph
     app.state.fmp = fmp
+    app.state.db = db
     try:
         yield
     finally:

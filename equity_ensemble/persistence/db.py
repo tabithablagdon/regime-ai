@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Protocol
 
 import asyncpg
@@ -59,6 +59,15 @@ class Database(Protocol):
         ...
 
     async def get_forecast(self, run_id: str) -> ForecastReport | None:
+        ...
+
+    async def get_recent_forecast(
+        self, ticker: str, horizon_days: int, *, max_age: timedelta
+    ) -> ForecastReport | None:
+        """Most recent forecast for this exact (ticker, horizon_days) pair
+        generated within `max_age`, or None. Backs the 24h result cache: a
+        hit means `run_forecast` skips the graph entirely — no LLM, FMP, or
+        embedding calls — and returns this instead."""
         ...
 
     async def list_pending_evaluations(self, *, as_of: date | None = None) -> list[ForecastReport]:
@@ -110,6 +119,19 @@ class FakeDatabase:
 
     async def get_forecast(self, run_id: str) -> ForecastReport | None:
         return self._forecasts.get(run_id)
+
+    async def get_recent_forecast(
+        self, ticker: str, horizon_days: int, *, max_age: timedelta
+    ) -> ForecastReport | None:
+        cutoff = datetime.now(UTC) - max_age
+        candidates = [
+            report
+            for report in self._forecasts.values()
+            if report.ticker.upper() == ticker.upper()
+            and report.horizon_days == horizon_days
+            and report.generated_at >= cutoff
+        ]
+        return max(candidates, key=lambda r: r.generated_at) if candidates else None
 
     async def list_pending_evaluations(self, *, as_of: date | None = None) -> list[ForecastReport]:
         as_of = as_of or date.today()
@@ -250,6 +272,24 @@ class PostgresDatabase:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT report FROM forecasts WHERE run_id = $1", uuid.UUID(str(run_id))
+            )
+        return ForecastReport.model_validate_json(row["report"]) if row else None
+
+    async def get_recent_forecast(
+        self, ticker: str, horizon_days: int, *, max_age: timedelta
+    ) -> ForecastReport | None:
+        cutoff = datetime.now(UTC) - max_age
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT report FROM forecasts
+                WHERE ticker = $1 AND horizon_days = $2 AND generated_at >= $3
+                ORDER BY generated_at DESC
+                LIMIT 1
+                """,
+                ticker.upper(),
+                horizon_days,
+                cutoff,
             )
         return ForecastReport.model_validate_json(row["report"]) if row else None
 
