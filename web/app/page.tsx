@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { EngineUnavailableBanner } from "@/components/EngineUnavailableBanner";
 import { ForecastReportView } from "@/components/ForecastReportView";
+import { LoadingIndicator } from "@/components/LoadingIndicator";
 import { TickerForm } from "@/components/TickerForm";
 import type { ForecastErrorBody, ForecastReport } from "@/lib/types";
 
@@ -61,12 +62,7 @@ export default function Home() {
       </div>
 
       <div className="mt-8">
-        {state.status === "loading" && (
-          <p style={{ color: "var(--ink-muted)" }}>
-            Running both specialist agents and reconciling their claims —
-            this can take up to a minute or so…
-          </p>
-        )}
+        {state.status === "loading" && <LoadingIndicator />}
 
         {state.status === "error" && state.error.kind === "engine_unavailable" && (
           <EngineUnavailableBanner message={state.error.message} />

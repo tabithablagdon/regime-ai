@@ -45,3 +45,19 @@ body {
   color: var(--foreground);
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
 }
+
+@keyframes spin-ring {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin-ring {
+  animation: spin-ring 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-spin-ring {
+    animation: none;
+  }
+}
